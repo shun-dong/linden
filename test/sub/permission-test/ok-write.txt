@@ -1,0 +1,2 @@
+write test inside owned region — should succeed
+edit test — v2

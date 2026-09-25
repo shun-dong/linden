@@ -1,0 +1,40 @@
+export * from "./ast.js";
+export * from "./parser.js";
+export * from "./checker.js";
+export {
+	assertWellFormedContexts,
+	authoritySnapshot,
+	canObserveResource,
+	canReadPath,
+	canWritePath,
+	deriveJudgment,
+	deriveRefinement,
+	emptyContext,
+	formatPathExpression,
+	hostSelectorContains,
+	intersectPath,
+	normalizePathExpression,
+	ownerOf,
+	pathExpressions,
+	pathExpressionContains,
+	pointersTo,
+	requireJudgment,
+	resolveLogicalPath,
+	subtractPath,
+} from "./judgment.js";
+export type {
+	AgentRole,
+	CompleteValue,
+	DeltaContext,
+	GammaContext,
+	Judgment,
+	JudgmentDerivation,
+	JudgmentDiagnostic,
+	JudgmentResult,
+	JudgmentState,
+	ParticipantContext,
+	ParticipantRole,
+	PathExpression,
+	RefinementJudgment,
+	WaitTarget,
+} from "./judgment.js";

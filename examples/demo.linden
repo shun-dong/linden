@@ -1,0 +1,11 @@
+a : File
+
+before = read &a
+a = write a "first revision"
+states = log &a
+n : StateId<a> = choose states
+a = checkout a n
+
+&>A = spawn! "inspect the implementation" &a
+send &>A "Check the current implementation."
+give! &>A a

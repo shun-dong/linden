@@ -1,0 +1,32 @@
+{
+  "name": "linden-authority-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "linden": "./dist/cli.js",
+    "linden-check": "./dist/check-cli.js"
+  },
+	"scripts": {
+		"postinstall": "node scripts/patch-pi-detach.mjs",
+		"build:term-supervisor": "node scripts/build-term-supervisor.mjs",
+		"clean:build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+		"clean:test": "node -e \"require('node:fs').rmSync('.tmp-test',{recursive:true,force:true})\"",
+		"prebuild": "npm run build:term-supervisor",
+		"build": "npm run clean:build && tsc --project tsconfig.build.json",
+		"check": "tsc --project tsconfig.json",
+		"pretest": "npm run build:term-supervisor",
+		"test": "npm run clean:test && tsc --project tsconfig.test.json && node --test .tmp-test/test/*.test.js",
+		"pretest:integration": "npm run build:term-supervisor",
+		"test:integration": "npm run clean:test && tsc --project tsconfig.test.json && node --test .tmp-test/test/integration.test.js .tmp-test/test/sandbox.test.js",
+		"dev": "pi --no-extensions -e ./src/pi/extension.ts"
+	},
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "typebox": "1.1.38"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

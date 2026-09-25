@@ -1,0 +1,18 @@
+[package]
+name = "linden-term-supervisor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+libc = "=0.2.189"
+serde_json = "=1.0.151"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
