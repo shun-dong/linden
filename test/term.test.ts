@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { sandboxRequirements } from "./runtime-requirements.js";
 import { createConnection, createServer } from "node:net";
 import test from "node:test";
 import type { EffectiveAuthority } from "../src/runtime/model.js";
@@ -11,9 +11,7 @@ import {
 	type TermEpochEndInfo,
 } from "../src/runtime/term.js";
 
-const hasRuntime = process.platform === "linux"
-	&& spawnSync("which", ["bwrap"], { stdio: "ignore" }).status === 0
-	&& spawnSync("which", ["script"], { stdio: "ignore" }).status === 0;
+const sandboxRuntime = await sandboxRequirements(["script", "socat"]);
 
 function workspaceAuthority(workspace: string): EffectiveAuthority {
 	const expression = { include: workspace, exclude: [] };
@@ -77,7 +75,7 @@ test("Term listen pages retained UTF-8 output without skipping undisclosed bytes
 	assert.equal(second.hasMore, true);
 });
 
-test("Term trusts supervisor completion and preserves only safe cwd/exports across epochs", { skip: !hasRuntime }, async () => {
+test("Term trusts supervisor completion and preserves only safe cwd/exports across epochs", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-state-"));
 	const nested = join(workspace, "nested");
 	mkdirSync(nested);
@@ -123,7 +121,7 @@ test("Term trusts supervisor completion and preserves only safe cwd/exports acro
 	}
 });
 
-test("Term control completion cannot be forged through output, a second socket, /proc fds, or pidfd_getfd", { skip: !hasRuntime }, async () => {
+test("Term control completion cannot be forged through output, a second socket, /proc fds, or pidfd_getfd", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-protocol-"));
 	const term = new PersistentTerm({
 		id: "term:protocol",
@@ -187,7 +185,7 @@ test("Term control completion cannot be forged through output, a second socket, 
 	}
 });
 
-test("Term never evaluates captured state after authority expands", { skip: !hasRuntime }, async () => {
+test("Term never evaluates captured state after authority expands", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-state-injection-"));
 	const safe = join(workspace, "safe");
 	const expanded = join(workspace, "expanded");
@@ -217,7 +215,7 @@ test("Term never evaluates captured state after authority expands", { skip: !has
 	}
 });
 
-test("Term chooses the structural parent of exact-File authority as cwd", { skip: !hasRuntime }, async () => {
+test("Term preserves an unreadable root as an empty sandbox skeleton", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-exact-cwd-"));
 	const file = join(workspace, "allowed.txt");
 	writeFileSync(file, "allowed-content");
@@ -236,15 +234,15 @@ test("Term chooses the structural parent of exact-File authority as cwd", { skip
 	const term = new PersistentTerm({ id: "term:exact-cwd", cwd: join(workspace, "unreadable-base"), privateRoots: [], authority });
 	try {
 		await term.initialize();
-		assert.equal((await term.exec("printf '%s|' \"$PWD\"; cat allowed.txt")).exitCode, 0);
-		assert.match((await term.listen()).data, new RegExp(`${workspace.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\|allowed-content`));
+		assert.equal((await term.exec(`printf '%s|' "$PWD"; cat "${file}"`)).exitCode, 0);
+		assert.match((await term.listen()).data, new RegExp(`${join(workspace, "unreadable-base").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\|allowed-content`));
 	} finally {
 		await term.dispose();
 		rmSync(workspace, { recursive: true, force: true });
 	}
 });
 
-test("Term start-hook failure does not end an unacquired lease and remains an error", { skip: !hasRuntime }, async () => {
+test("Term start-hook failure does not end an unacquired lease and remains an error", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-lease-"));
 	let ended = 0;
 	const term = new PersistentTerm({
@@ -268,7 +266,7 @@ test("Term start-hook failure does not end an unacquired lease and remains an er
 	}
 });
 
-test("Term input is running-only and interrupt targets the PTY foreground", { skip: !hasRuntime }, async () => {
+test("Term input is running-only and interrupt targets the PTY foreground", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-input-"));
 	const term = new PersistentTerm({
 		id: "term:input",
@@ -307,7 +305,7 @@ test("Term input is running-only and interrupt targets the PTY foreground", { sk
 	}
 });
 
-test("Term keeps an epoch ready for jobs and tracks disowned sandbox descendants", { skip: !hasRuntime }, async () => {
+test("Term keeps an epoch ready for jobs and tracks disowned sandbox descendants", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-background-"));
 	const ends: TermEpochEndInfo[] = [];
 	const term = new PersistentTerm({
@@ -340,7 +338,7 @@ test("Term keeps an epoch ready for jobs and tracks disowned sandbox descendants
 	}
 });
 
-test("Term keeps network isolation while explicitly bridging a listening service to parent loopback", { skip: !hasRuntime }, async () => {
+test("Term keeps network isolation while explicitly bridging a listening service to parent loopback", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-loopback-"));
 	const port = await freeLoopbackPort();
 	const term = new PersistentTerm({
@@ -364,7 +362,7 @@ test("Term keeps network isolation while explicitly bridging a listening service
 	}
 });
 
-test("Term records command output ranges and bounded output for a multi-command epoch", { skip: !hasRuntime }, async () => {
+test("Term records command output ranges and bounded output for a multi-command epoch", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-trace-"));
 	const ends: TermEpochEndInfo[] = [];
 	const term = new PersistentTerm({
@@ -408,7 +406,7 @@ test("Term records command output ranges and bounded output for a multi-command 
 	}
 });
 
-test("Term marks an epoch when its bounded retained output loses the prefix", { skip: !hasRuntime }, async () => {
+test("Term marks an epoch when its bounded retained output loses the prefix", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-trace-truncated-"));
 	const ends: TermEpochEndInfo[] = [];
 	const term = new PersistentTerm({
@@ -437,7 +435,7 @@ test("Term marks an epoch when its bounded retained output loses the prefix", { 
 	}
 });
 
-test("Term serializes a slow epoch start with stop and leaves no open lease", { skip: !hasRuntime }, async () => {
+test("Term serializes a slow epoch start with stop and leaves no open lease", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-start-stop-"));
 	let enterStart!: () => void;
 	const startEntered = new Promise<void>((resolvePromise) => { enterStart = resolvePromise; });
@@ -485,7 +483,7 @@ test("Term serializes a slow epoch start with stop and leaves no open lease", { 
 	}
 });
 
-test("Term exposes reconciliation as busy and dispose propagates epoch-end failure", { skip: !hasRuntime }, async () => {
+test("Term exposes reconciliation as busy and dispose propagates epoch-end failure", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-reconcile-"));
 	let releaseEnd!: () => void;
 	const endGate = new Promise<void>((resolvePromise) => { releaseEnd = resolvePromise; });
@@ -533,7 +531,7 @@ test("Term exposes reconciliation as busy and dispose propagates epoch-end failu
 	}
 });
 
-test("Term retains an epoch when sandbox termination fails and retries cleanup", { skip: !hasRuntime }, async () => {
+test("Term retains an epoch when sandbox termination fails and retries cleanup", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-close-retry-"));
 	let ends = 0;
 	const term = new PersistentTerm({
@@ -565,7 +563,7 @@ test("Term retains an epoch when sandbox termination fails and retries cleanup",
 	}
 });
 
-test("Term does not retry an epoch-end error already durably committed", { skip: !hasRuntime }, async () => {
+test("Term does not retry an epoch-end error already durably committed", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-committed-end-"));
 	let ends = 0;
 	const term = new PersistentTerm({
@@ -593,7 +591,7 @@ test("Term does not retry an epoch-end error already durably committed", { skip:
 	}
 });
 
-test("Term interrupt escalates only the uncooperative foreground", { skip: !hasRuntime }, async () => {
+test("Term interrupt escalates only the uncooperative foreground", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-interrupt-kill-"));
 	const term = new PersistentTerm({
 		id: "term:interrupt-kill",

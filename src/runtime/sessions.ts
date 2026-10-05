@@ -1,14 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { canonicalBase, isInside } from "./paths.js";
+import { initialPermissions, writeReservations, writesOverlap, type WriteReservation } from "./permissions.js";
+import { canonicalBase } from "./paths.js";
 import { atomicJson, lindenStateRoot, stateDirectory } from "./store.js";
 import { normalizeMaxAgentDepth } from "./agent-depth.js";
 
 export interface SessionManifest {
-	schemaVersion: 4;
+	schemaVersion: 4 | 5;
 	id: string;
 	base: string;
+	permissions?: string[];
 	/** Maximum number of Agent nodes on a root-to-participant path; absent means unlimited. */
 	maxAgentDepth?: number;
 	createdAt: number;
@@ -16,9 +18,10 @@ export interface SessionManifest {
 }
 
 interface ActiveLeaseRecord {
-	schemaVersion: 1;
+	schemaVersion: 1 | 2;
 	sessionId: string;
 	base: string;
+	writes?: WriteReservation[];
 	pid: number;
 	token: string;
 	updatedAt: number;
@@ -78,7 +81,7 @@ export class SessionRegistry {
 		mkdirSync(this.activeDir, { recursive: true });
 	}
 
-	create(baseInput: string, requestedId?: string, options: { maxAgentDepth?: number } = {}): SessionManifest {
+	create(baseInput: string, requestedId?: string, options: { maxAgentDepth?: number; permissions?: readonly string[]; noDefaultPermissions?: boolean } = {}): SessionManifest {
 		const base = canonicalBase(baseInput);
 		const maxAgentDepth = normalizeMaxAgentDepth(options.maxAgentDepth);
 		const id = requestedId ?? `session:${randomUUID()}`;
@@ -86,7 +89,7 @@ export class SessionRegistry {
 		const path = manifestPath(this.root, id);
 		if (existsSync(path)) throw new Error(`Linden session ${id} already exists`);
 		const timestamp = Date.now();
-		const manifest: SessionManifest = { schemaVersion: 4, id, base, ...(maxAgentDepth === undefined ? {} : { maxAgentDepth }), createdAt: timestamp, lastOpenedAt: timestamp };
+		const manifest: SessionManifest = { schemaVersion: 5, id, base, permissions: initialPermissions(options.permissions ?? [], base, options.noDefaultPermissions), ...(maxAgentDepth === undefined ? {} : { maxAgentDepth }), createdAt: timestamp, lastOpenedAt: timestamp };
 		atomicJson(path, manifest);
 		return manifest;
 	}
@@ -99,7 +102,7 @@ export class SessionRegistry {
 			if (!existsSync(path)) continue;
 			try {
 				const value = JSON.parse(readFileSync(path, "utf8")) as SessionManifest;
-				if (value.schemaVersion === 4 && typeof value.id === "string" && typeof value.base === "string") {
+				if ((value.schemaVersion === 4 || value.schemaVersion === 5) && typeof value.id === "string" && typeof value.base === "string") {
 					normalizeMaxAgentDepth(value.maxAgentDepth, "session maxAgentDepth");
 					result.push(value);
 				}
@@ -126,15 +129,15 @@ export class SessionRegistry {
 		return next;
 	}
 
-	acquire(manifest: SessionManifest): SessionLease {
+	acquire(manifest: SessionManifest, writes = writeReservations(manifest.permissions ?? [`file:${manifest.base}/`], manifest.base)): SessionLease {
 		return this.withGuard(() => {
 			const active = this.readActiveLeases();
 			for (const item of active) {
-				if (item.sessionId === manifest.id || isInside(item.base, manifest.base) || isInside(manifest.base, item.base)) {
-					throw new Error(`ACTIVE_BASE_CONFLICT: ${manifest.base} overlaps active ${item.base} (${item.sessionId}, pid=${item.pid})`);
+				if (item.sessionId === manifest.id || writes.some((a) => (item.writes ?? [{ include: item.base, exclude: [], region: true }]).some((b) => writesOverlap(a, b)))) {
+					throw new Error(`ACTIVE_WRITE_CONFLICT: workspace ${manifest.id} write authority overlaps ${item.sessionId} (${item.sessionId}, pid=${item.pid})`);
 				}
 			}
-			const record: ActiveLeaseRecord = { schemaVersion: 1, sessionId: manifest.id, base: manifest.base, pid: process.pid, token: randomUUID(), updatedAt: Date.now() };
+			const record: ActiveLeaseRecord = { schemaVersion: 2, sessionId: manifest.id, base: manifest.base, writes, pid: process.pid, token: randomUUID(), updatedAt: Date.now() };
 			const path = join(this.activeDir, `${sessionUuid(manifest.id)}.json`);
 			atomicJson(path, record);
 			return new SessionLease(path, record);
@@ -148,7 +151,7 @@ export class SessionRegistry {
 			const path = join(this.activeDir, name);
 			try {
 				const record = JSON.parse(readFileSync(path, "utf8")) as ActiveLeaseRecord;
-				const stale = !processAlive(record.pid) || Date.now() - record.updatedAt > 30_000;
+				const stale = !processAlive(record.pid);
 				if (stale) { rmSync(path, { force: true }); continue; }
 				result.push(record);
 			} catch { rmSync(path, { force: true }); }

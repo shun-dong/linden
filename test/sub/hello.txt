@@ -1,2 +1,0 @@
-EDITED-hello
-version-2: permission test second write

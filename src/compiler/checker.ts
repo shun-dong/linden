@@ -4,7 +4,7 @@ import { parse } from "./parser.js";
 
 export type ParticipantKindName = "Human" | "Agent" | "Term";
 export type ParticipantLifecycle = "running" | "ready" | "stopped";
-export type CompleteKind = "File" | "Web" | ParticipantKindName;
+export type CompleteKind = "File" | "Web" | "Net" | ParticipantKindName;
 export type ValueType =
 	| { kind: "complete"; resource: CompleteKind; identity: string; path?: PathExpression }
 	| { kind: "pointer"; resource: CompleteKind; identity: string; role?: "child" | "descendant" | "parent"; peer?: string; path?: PathExpression }
@@ -89,7 +89,7 @@ interface Evaluated {
 	residuals: Map<string, PathExpression>;
 }
 
-const completeKinds = new Set<CompleteKind>(["File", "Web", "Human", "Agent", "Term"]);
+const completeKinds = new Set<CompleteKind>(["File", "Web", "Net", "Human", "Agent", "Term"]);
 const participantKinds = new Set<ParticipantKindName>(["Human", "Agent", "Term"]);
 const isComplete = (type: ValueType): type is Extract<ValueType, { kind: "complete" }> => type.kind === "complete";
 const objectName = (type: Extract<ValueType, { kind: "complete" | "pointer" }>): string => {
@@ -172,7 +172,7 @@ export class ProgramChecker {
 		if (completeKinds.has(annotation as CompleteKind)) return { kind: "complete", resource: annotation as CompleteKind, identity: bindingName };
 		if (annotation === "String") return { kind: "string" };
 		if (annotation === "Unit" || annotation === "1") return { kind: "unit" };
-		const pointer = /^&((?:>>|>|<)?)(File|Web|Human|Agent|Term)$/.exec(annotation);
+		const pointer = /^&((?:>>|>|<)?)(File|Web|Net|Human|Agent|Term)$/.exec(annotation);
 		if (pointer) {
 			const role = pointer[1] === ">" ? "child" : pointer[1] === ">>" ? "descendant" : pointer[1] === "<" ? "parent" : undefined;
 			return { kind: "pointer", resource: pointer[2] as CompleteKind, identity: bindingName, role, peer: role ? bindingName : undefined };
@@ -353,6 +353,23 @@ export class ProgramChecker {
 		const result = (type: ValueType): Evaluated => ({ type, consumes, preserves, dependencies, residuals });
 
 		switch (expression.name) {
+			case "connect": {
+				if (!this.requirePrivilege(expression, false) || !this.requireArity(expression, 1)) return undefined;
+				const net = preserve(use(0));
+				if (!net || (net.type.kind !== "complete" && net.type.kind !== "pointer") || net.type.resource !== "Net") return this.report("TYPE_MISMATCH", "connect requires Net or &Net", expression.span);
+				return result({ kind: "unit" });
+			}
+			case "publish":
+			case "unpublish": {
+				if (!this.requirePrivilege(expression, true) || !this.requireArity(expression, expression.name === "publish" ? 3 : 2)) return undefined;
+				const term = preserve(use(0, "term"));
+				const net = preserve(use(1, "complete"));
+				if (!term || term.type.kind !== "pointer" || (term.type.role !== "child" && term.type.role !== "descendant")) return this.report("ROLE_MISMATCH", "Publication requires control of a Term descendant", expression.span);
+				if (!net || net.type.kind !== "complete" || net.type.resource !== "Net") return this.report("TYPE_MISMATCH", "Publication requires complete Net", expression.span);
+				if (expression.name === "publish" && !preserve(use(2, "string"))) return undefined;
+				dependencies.add(`control:${term.type.identity}`);
+				return result({ kind: "unit" });
+			}
 			case "subpath":
 			case "file": {
 				if (!this.requireArity(expression, 2)) return undefined;
@@ -512,6 +529,7 @@ export class ProgramChecker {
 					const grant = use(index);
 					if (!grant || (grant.type.kind !== "complete" && grant.type.kind !== "pointer")) return this.report("TYPE_MISMATCH", "spawn! permissions must be complete resources or ordinary pointers", expression.arguments[index].span);
 					if (grant.type.kind === "pointer" && grant.type.role) return this.report("ROLE_FORGERY", "spawn! cannot provision an existing role pointer", expression.arguments[index].span);
+					if (grant.type.kind === "pointer" && grant.type.resource === "Net" && this.bindings.get(expression.arguments[index].kind === "pointer" ? (expression.arguments[index] as any).name : "")?.type.kind !== "complete") return this.report("TYPE_MISMATCH", "&Net cannot be delegated or inherited", expression.arguments[index].span);
 					if (grant.type.kind === "complete") consume(grant); else preserve(grant);
 				}
 				const identity = `${participantKind.toLowerCase()}:${resultName ?? "fresh"}`;
@@ -532,6 +550,7 @@ export class ProgramChecker {
 				if (!role || role.type.kind !== "pointer" || (role.type.role !== "child" && role.type.role !== "parent")) return role ? this.report("ROLE_MISMATCH", "give! requires a direct parent or child role pointer", expression.arguments[0].span) : undefined;
 				if (!resource || (resource.type.kind !== "complete" && resource.type.kind !== "pointer")) return resource ? this.report("TYPE_MISMATCH", "give! requires a complete resource or ordinary pointer", expression.arguments[1].span) : undefined;
 				if (resource.type.kind === "pointer" && resource.type.role) return this.report("ROLE_FORGERY", "give! cannot grant a participant role pointer", expression.arguments[1].span);
+				if (resource.type.kind === "pointer" && resource.type.resource === "Net" && this.bindings.get(expression.arguments[1].kind === "pointer" ? (expression.arguments[1] as any).name : "")?.type.kind !== "complete") return this.report("TYPE_MISMATCH", "&Net cannot be delegated", expression.arguments[1].span);
 				if (resource.type.kind === "complete") consume(resource); else preserve(resource);
 				dependencies.add(`edge:${role.type.peer ?? role.type.identity}`);
 				return result({ kind: "unit" });

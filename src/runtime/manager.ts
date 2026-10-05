@@ -1,3 +1,8 @@
+import { legacyAgentBranches, validAgentBranchName } from "./agent-history.js";
+import { NetGuard } from "./net-guard.js";
+import type { NetworkBridge } from "./network-bridge.js";
+import { initialPermissions, filePermission, type WriteReservation } from "./permissions.js";
+import { netReference, privateAddress } from "./net.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { userInfo } from "node:os";
@@ -11,6 +16,7 @@ import {
 	deriveRefinement,
 	emptyContext,
 	hasOrdinaryParticipantPointer,
+	hostSelectorContains,
 	ownerOf,
 	pathExpressions,
 	pointersTo,
@@ -21,6 +27,7 @@ import {
 } from "../compiler/judgment.js";
 import type {
 	AgentStateNode,
+	AgentBranches,
 	AuthorityOperation,
 	AuthorityState,
 	CheckpointId,
@@ -48,10 +55,10 @@ import type {
 	VersionNode,
 	WebResource,
 } from "./model.js";
-import { canonicalBase, canonicalCandidate, fileResourceId, isInside, resolvePublicPath } from "./paths.js";
+import { canonicalBase, canonicalCandidate, fileResourceId, isInside, pathExpressionContains, resolvePublicPath } from "./paths.js";
 import { AuthorityStore, atomicJson, hashBuffer, lindenStateRoot, stateDirectory, type BashJournal, type FileJournal } from "./store.js";
 import { cleanupAbsentWritePlaceholders, DynamicSandbox, type PlaceholderCleanupResult, type SandboxRunOptions } from "./sandbox.js";
-import { hostSelectorContains, resolveWebResourceReference } from "../runtime/network.js";
+import { resolveWebResourceReference } from "./compat/network.js";
 import { normalizeMaxAgentDepth } from "./agent-depth.js";
 
 export interface ManagerOptions {
@@ -65,7 +72,8 @@ export interface ManagerOptions {
 	rootParticipantId?: ParticipantId;
 	sessionParticipantId?: ParticipantId;
 	sessionFile?: string;
-	webDomains?: string[];
+	permissions?: readonly string[];
+	noDefaultPermissions?: boolean;
 	/** Maximum Agent edge depth below the human root; absent means unlimited. */
 	maxAgentDepth?: number;
 	stateDir?: string;
@@ -80,6 +88,17 @@ export interface FileMutationResult {
 	path: string;
 	hash: string;
 	size: number;
+}
+
+export interface FileTransferUpdate {
+	resourceId: ResourceId;
+	stateId: VersionId;
+	change: "saved" | "verified";
+}
+
+export interface AuthorityTransferReceipt {
+	resources: ResourceId[];
+	fileUpdates: FileTransferUpdate[];
 }
 
 export interface BashExecutionResult {
@@ -287,12 +306,17 @@ function makeInitialState(options: { base: string; sessionId: string; rootPartic
 		id: options.rootParticipantId,
 		name: username,
 		kind: "human",
+		rootDir: options.base,
+		permissionMode: "manual",
 		childIds: [],
 		status: "stopped",
 		createdAt,
 	};
 	return {
-		schemaVersion: 6,
+		schemaVersion: 8,
+		explicitAuthority: true,
+		archives: {},
+		runtimeEvents: [],
 		sessionId: options.sessionId,
 		base: options.base,
 		...(options.maxAgentDepth === undefined ? {} : { maxAgentDepth: options.maxAgentDepth }),
@@ -309,6 +333,7 @@ function makeInitialState(options: { base: string; sessionId: string; rootPartic
 		checkpoints: {},
 		agentStates: {},
 		currentAgentStateIds: {},
+		agentBranches: {},
 		termEpochs: {},
 	};
 }
@@ -323,6 +348,8 @@ export class SessionAuthorityManager {
 	readonly privateRoots: string[];
 	readonly sandboxTmpPath?: string;
 	readonly store: AuthorityStore;
+	private readonly networkBridges = new Map<string, Set<NetworkBridge>>();
+	readonly publications = new Map<string, { ownerId: string; termId: string; internalPort: number; socketPath: string; state: "starting" | "ready" | "failed" }>();
 	private readonly commitMutex = new AsyncMutex();
 	private readonly resourceWriterGate = new AsyncMutex();
 	private readonly payloadMutexes = new Map<ParticipantId, AsyncMutex>();
@@ -366,7 +393,7 @@ export class SessionAuthorityManager {
 			}
 			this.sandboxTmpPath = candidate;
 		}
-		const loaded = this.store.load(this.base, this.privateRoots);
+		let loaded = this.store.load(this.base, this.privateRoots);
 		if (loaded) normalizeMaxAgentDepth(loaded.maxAgentDepth, "persisted maxAgentDepth");
 		if (loaded && requestedMaxAgentDepth !== undefined && loaded.maxAgentDepth !== requestedMaxAgentDepth) {
 			throw new Error(`Linden session maxAgentDepth is ${loaded.maxAgentDepth ?? "unlimited"}, not ${requestedMaxAgentDepth}`);
@@ -381,9 +408,29 @@ export class SessionAuthorityManager {
 		if (this.state.base !== this.base) throw new Error(`Linden session ${this.sessionId} belongs to base ${this.state.base}, not ${this.base}`);
 		if (this.state.sessionId !== this.sessionId) throw new Error(`Linden ledger belongs to ${this.state.sessionId}, not ${this.sessionId}`);
 		if (this.state.rootParticipantId !== rootParticipantId) throw new Error("Linden ledger belongs to a different human participant");
+		if (!loaded) this.initializePermissions(initialPermissions(options.permissions ?? [], this.base, options.noDefaultPermissions));
+		else if (loaded.schemaVersion === 6) {
+			// Keep an immutable original before materializing formerly implicit rights.
+			if (!existsSync(join(this.stateDir, "ledger.v6.backup.json"))) atomicJson(join(this.stateDir, "ledger.v6.backup.json"), JSON.parse(readFileSync(this.store.ledgerPath, "utf8")));
+			this.materializeBaseRegion(false);
+			this.initializePermissions(["net:tcp/public"]);
+			this.state.schemaVersion = 7;
+			this.state.explicitAuthority = true;
+			this.state.initialPermissions = [`file:${this.base}/`, "net:tcp/public"];
+			this.state.archives = {};
+			this.state.runtimeEvents = [];
+			for (const participant of Object.values(this.state.participants)) participant.rootDir ??= this.base;
+			this.persist();
+		}
+		if (this.state.schemaVersion !== 8) {
+			if (loaded?.schemaVersion === 7 && !existsSync(join(this.stateDir, "ledger.v7.backup.json"))) atomicJson(join(this.stateDir, "ledger.v7.backup.json"), JSON.parse(readFileSync(this.store.ledgerPath, "utf8")));
+			this.state.schemaVersion = 8;
+			this.persist();
+		}
 		const normalizedMessages = this.normalizeMessages();
 		const normalizedParticipants = this.normalizeParticipantStatuses();
 		assertWellFormedContexts(this.state);
+		if (!loaded) this.state.saveBaseline = this.scan(this.effectiveAuthority(this.rootParticipantId).writePaths, [], true);
 		this.state.lastOpenedAt = now();
 		if (!loaded || normalizedMessages || normalizedParticipants) this.store.save(this.state);
 	}
@@ -393,6 +440,283 @@ export class SessionAuthorityManager {
 		await manager.recover();
 		if (options.sessionId) await manager.ensureTopLevelSession(options);
 		return manager;
+	}
+
+	private initializePermissions(inputs: readonly string[]): void {
+		this.state.initialPermissions ??= [...inputs];
+		const identities = new Set<string>();
+		for (const input of inputs) {
+			const key = input.startsWith("&") ? input.slice(1) : input;
+			if (identities.has(key)) throw new Error(`Duplicate initial permission ${key}`);
+			identities.add(key);
+			const read = input.startsWith("&");
+			const typed = read ? input.slice(1) : input;
+			if (typed.startsWith("net:")) {
+				const endpoint = netReference(typed);
+				if (!this.state.resources[endpoint.id]) {
+					this.state.resources[endpoint.id] = { ...endpoint, kind: "net", createdAt: now() };
+					this.installComplete(this.rootParticipantId, endpoint.id);
+				}
+				if (read) this.moveToEnvironment(endpoint.id);
+				continue;
+			}
+			const permission = filePermission(input, this.base);
+			resolvePublicPath(permission.path, this.base, this.base, this.privateRoots);
+			if (!permission.region) {
+				const snapshot = this.store.capture(permission.path, true, true);
+				const id = versionId(permission.id);
+				this.state.resources[permission.id] = { id: permission.id, kind: "file", path: permission.path, versioned: true, versions: [{ id, snapshot, participantId: this.rootParticipantId, operation: "initial", createdAt: now() }], currentVersionId: id, createdAt: now() };
+			} else this.state.resources[permission.id] ??= { id: permission.id, kind: "file-region", path: permission.path, createdAt: now() };
+			this.installComplete(this.rootParticipantId, permission.id);
+			if (read) this.moveToEnvironment(permission.id);
+		}
+	}
+
+	private moveToEnvironment(resourceId: string): void {
+		const root = this.state.contexts[this.rootParticipantId];
+		const value = root.delta.completeValues.find((item) => item.identity === resourceId)!;
+		root.delta.completeValues = root.delta.completeValues.filter((item) => item.identity !== resourceId);
+		this.state.contexts.environment ??= { delta: { completeValues: [] }, gamma: { resourcePointers: [], agentPointers: [], roles: [] } };
+		this.state.contexts.environment.delta.completeValues.push(value);
+	}
+
+	workspaceWrites(): WriteReservation[] {
+		return Object.values(this.state.resources).filter((resource) => (resource.kind === "file" || resource.kind === "file-region") && !!this.ownerOf(resource.id) && this.ownerOf(resource.id) !== "environment").map((resource) => ({ include: (resource as FileResource | FileRegionResource).path, region: resource.kind === "file-region", exclude: [] }));
+	}
+
+	participantRoot(participantId: string): string {
+		const participant = this.state.participants[participantId];
+		if (!participant) throw new Error(`Unknown participant ${participantId}`);
+		return participant.rootDir ?? this.base;
+	}
+
+	async setPermissionMode(participantId: string, mode: "manual" | "all-of-mine"): Promise<void> {
+		if (mode !== "manual" && mode !== "all-of-mine") throw new Error("permission mode must be manual or all-of-mine");
+		await this.commitMutex.run(() => this.persistStaged(() => {
+			const participant = this.state.participants[participantId];
+			if (!participant || participant.kind === "term") throw new Error("Only a live Human or Agent may set permission policy");
+			participant.permissionMode = mode;
+			this.commitEffect("permission", participantId);
+		}));
+	}
+
+	queueRuntimeEvent(participantId: string, text: string, kind = "authority-change"): string {
+		const id = `runtime:${randomUUID()}`;
+		(this.state.runtimeEvents ??= []).push({ id, participantId, text, kind });
+		return id;
+	}
+
+	async acknowledgeRuntimeEvent(id: string): Promise<void> {
+		await this.commitMutex.run(() => this.persistStaged(() => {
+			const event = this.state.runtimeEvents?.find((candidate) => candidate.id === id);
+			if (event) event.delivered = true;
+		}));
+	}
+
+	/** Restore a retained subtree only when every complete value is available. */
+	async unarchiveParticipant(participantId: string, targetId: string): Promise<string[]> {
+		return this.resourceWriterGate.run(() => this.commitMutex.run(() => this.persistStaged(() => {
+			if (this.state.archived) throw new Error("WORKSPACE_ARCHIVED");
+			const template = this.state.archives?.[targetId];
+			if (!template || template.participants[targetId]?.parentId !== participantId || !this.state.participants[participantId]) throw new Error("UNARCHIVE_REQUIRES_RETAINED_DIRECT_CHILD");
+			this.assertNoOpenTermEpoch(participantId, "restore a child");
+			const resourceIds = Object.values(template.contexts).flatMap((context) => context.delta.completeValues.filter((value) => !!this.state.resources[value.identity]).map((value) => value.identity));
+			for (const id of resourceIds) if (this.ownerOf(id) !== participantId) throw new Error(`UNARCHIVE_AUTHORITY_CONFLICT: ${id} is no longer held by ${participantId}`);
+			for (const context of Object.values(template.contexts)) for (const id of context.gamma.resourcePointers) {
+				if (!resourceIds.includes(id) && (this.state.resources[id]?.kind === "net" ? this.ownerOf(id) !== participantId : !canObserveResource(this.state, participantId, id))) throw new Error(`UNARCHIVE_AUTHORITY_CONFLICT: cannot restore projection ${id}`);
+			}
+			for (const id of Object.keys(template.participants)) {
+				if (this.state.participants[id]) throw new Error(`UNARCHIVE_ID_CONFLICT: ${id}`);
+				this.state.participants[id] = { ...structuredClone(template.participants[id]), status: "stopped" };
+				this.state.contexts[id] = structuredClone(template.contexts[id]);
+				delete this.state.participantTombstones[id];
+			}
+			const parent = this.state.participants[participantId];
+			parent.childIds.push(targetId);
+			const parentContext = this.state.contexts[participantId];
+			parentContext.delta.completeValues = parentContext.delta.completeValues.filter((value) => !resourceIds.includes(value.identity));
+			parentContext.gamma.roles.push({ targetId, role: "parent" });
+			parentContext.gamma.agentPointers = unique([...parentContext.gamma.agentPointers, targetId]);
+			// Net is a use capability, so the old complete holder loses its use.
+			parentContext.gamma.resourcePointers = parentContext.gamma.resourcePointers.filter((id) => !resourceIds.includes(id) || this.state.resources[id].kind !== "net");
+			Object.assign(this.state.checkpoints, structuredClone(template.checkpoints));
+			Object.assign(this.state.agentStates, structuredClone(template.agentStates));
+			Object.assign(this.state.currentAgentStateIds, structuredClone(template.currentAgentStateIds));
+			for (const [id, participant] of Object.entries(template.participants)) if (participant.kind === "agent") {
+				(this.state.agentBranches ??= {})[id] = structuredClone(template.agentBranches?.[id] ?? legacyAgentBranches(template.currentAgentStateIds[id]));
+			}
+			for (const [id, context] of Object.entries(template.contexts)) {
+				// Archived unread mail is retained for audit/explicit consumption,
+				// but does not silently activate an old task after restoration.
+				this.state.contexts[id].delta.completeValues = context.delta.completeValues.map((value) => this.state.resources[value.identity] ? this.completeValue(value.identity) : value);
+			}
+			for (const message of Object.values(template.messages)) this.state.messages[message.id] = { ...message, deferred: !message.consumedAt, deliveryBatchId: undefined, queuedAt: undefined };
+			this.reconcileRestoredFiles(template.files, Object.keys(template.participants));
+			this.commitEffect("unarchive", participantId, undefined, undefined, targetId);
+			delete this.state.archives![targetId];
+			return Object.keys(template.participants);
+		})));
+	}
+
+	private reconcileRestoredFiles(before: Record<string, SnapshotRef>, participantIds: string[]): void {
+		const observed = unique(participantIds.flatMap((id) => this.effectiveAuthority(id).readPaths));
+		const after = this.scan(observed);
+		const absent: SnapshotRef = { exists: false, hash: hashBuffer("linden:absent:v1") };
+		const changed = unique([...Object.keys(before), ...Object.keys(after)]).filter((path) => (before[path]?.hash ?? absent.hash) !== (after[path]?.hash ?? absent.hash) || before[path]?.mode !== after[path]?.mode);
+		for (const path of changed) {
+			let resource = this.fileAt(path);
+			const owner = resource ? this.ownerOf(resource.id) : participantIds.find((id) => canWritePath(this.state, id, path));
+			if (!owner || owner === "environment") continue;
+			resource ??= this.materializeFile(path, owner, before[path] ?? absent, undefined, "write", false);
+			this.appendVersion(resource, versionId(resource.id), after[path] ?? absent, owner, "save");
+			delete resource.divergence;
+		}
+		for (const id of participantIds) if (this.state.participants[id]?.kind === "agent") {
+			const files = changed.filter((path) => canReadPath(this.state, id, path));
+			const nets = this.effectiveAuthority(id).netEndpoints ?? [];
+			if (files.length || nets.length) this.queueRuntimeEvent(id, `[Linden restoration update]\n${files.length ? `Files changed while archived: ${files.join(", ")}.\n` : ""}${nets.length ? `Net authority restored: ${nets.join(", ")}. Connections and publication bridges were not restored; verify service state before use.` : ""}`, "restore");
+		}
+	}
+
+	async archiveWorkspace(): Promise<void> {
+		await this.resourceWriterGate.run(() => this.commitMutex.run(() => this.persistStaged(() => {
+			if (this.state.archived) return;
+			if (this.activeTermEpochs.size || Object.values(this.state.participants).some((participant) => participant.status !== "stopped")) throw new Error("WORKSPACE_ARCHIVE_REQUIRES_STOPPED_TREE");
+			this.state.workspaceFiles = this.scan(unique(Object.keys(this.state.participants).flatMap((id) => this.effectiveAuthority(id).readPaths)));
+			this.state.workspaceContexts = structuredClone(this.state.contexts);
+			this.state.contexts.environment ??= { delta: { completeValues: [] }, gamma: { resourcePointers: [], agentPointers: [], roles: [] } };
+			for (const [id, context] of Object.entries(this.state.contexts)) {
+				if (id === "environment") continue;
+				this.state.contexts.environment.delta.completeValues.push(...context.delta.completeValues.filter((value) => !!this.state.resources[value.identity]));
+				context.delta.completeValues = context.delta.completeValues.filter((value) => !this.state.resources[value.identity]);
+				context.gamma.resourcePointers = [];
+			}
+			for (const message of Object.values(this.state.messages)) if (!message.consumedAt) { message.deferred = true; delete message.deliveryBatchId; delete message.queuedAt; }
+			this.state.archived = true;
+			this.commitEffect("archive", this.rootParticipantId, undefined, undefined, this.rootParticipantId);
+		})));
+	}
+
+	async unarchiveWorkspace(): Promise<void> {
+		await this.resourceWriterGate.run(() => this.commitMutex.run(() => this.persistStaged(() => {
+			if (!this.state.archived) return;
+			if (!this.state.workspaceContexts) throw new Error("WORKSPACE_RESTORE_TEMPLATE_MISSING");
+			this.state.contexts = structuredClone(this.state.workspaceContexts);
+			this.state.archived = false;
+			this.reconcileRestoredFiles(this.state.workspaceFiles ?? {}, Object.keys(this.state.participants));
+			this.commitEffect("unarchive", this.rootParticipantId, undefined, undefined, this.rootParticipantId);
+			delete this.state.workspaceContexts;
+			delete this.state.workspaceFiles;
+		})));
+	}
+
+	async saveExternalChanges(participantId: string): Promise<string[]> {
+		return this.resourceWriterGate.run(() => this.commitMutex.run(() => {
+			if (participantId !== this.rootParticipantId || this.state.archived) throw new Error("SAVE_REQUIRES_ACTIVE_HUMAN");
+			const authority = this.effectiveAuthority(participantId);
+			this.assertNoTermWriteOverlap(authority.writePaths, "save external changes");
+			const exclusions = unique([...authority.denyWritePaths, ...authority.absentWriteFileExclusions, ...authority.unsafeAbsentWriteExclusions]);
+			const before = Object.fromEntries(Object.entries(this.state.saveBaseline ?? {}).filter(([path]) => canWritePath(this.state, participantId, path)));
+			for (const resource of Object.values(this.state.resources)) if (resource.kind === "file" && canWritePath(this.state, participantId, resource.path)) before[resource.path] = this.versionNode(resource, resource.currentVersionId)!.snapshot;
+			const after = this.scan(authority.writePaths, exclusions, true);
+			const verification = this.scan(authority.writePaths, exclusions, true);
+			if (JSON.stringify(after) !== JSON.stringify(verification)) throw new Error("SAVE_UNSTABLE_FILES: retry when external writes finish");
+			const journal: BashJournal = { version: 1, type: "bash", operation: "save", id: randomUUID(), effectId: `effect:${randomUUID()}`, participantId, roots: authority.writePaths, exclusions, before, after, createdAt: now() };
+			this.store.writeJournal(journal);
+			const changed = this.commitBashJournal(journal, "save", "save", undefined, "committed");
+			this.removeCommittedJournal(journal.id);
+			return changed;
+		}));
+	}
+
+	private authorityEvents(participantIds: string[], resourceIds: string[], fileUpdates: FileTransferUpdate[] = []): void {
+		const details = fileUpdates.map((update) => update.change === "saved"
+			? `External disk changes saved as a new File version: ${update.resourceId} -> ${update.stateId}.`
+			: `Disk verified against the current File version: ${update.resourceId} -> ${update.stateId}; divergence cleared.`);
+		for (const id of new Set(participantIds)) if (this.state.participants[id]?.kind === "agent") this.queueRuntimeEvent(id, [`[Linden authority update] ${resourceIds.join(", ")} changed. Consult authority for current permissions.`, ...details].join("\n"));
+	}
+
+	registerNetworkBridge(participantId: string, bridge: NetworkBridge): void {
+		const bridges = this.networkBridges.get(participantId) ?? new Set<NetworkBridge>();
+		bridges.add(bridge);
+		this.networkBridges.set(participantId, bridges);
+	}
+
+	networkGuard(participantId: string): NetGuard {
+		return new NetGuard(() => {
+			if (this.state.archived || !this.state.participants[participantId]) return { endpoints: [], exclusions: [] };
+			const authority = this.effectiveAuthority(participantId);
+			return { endpoints: authority.netEndpoints ?? [], exclusions: authority.netExclusions ?? [] };
+		}, (id) => {
+			const publication = this.publications.get(id);
+			if (!publication) return undefined;
+			publication.state = existsSync(publication.socketPath) ? "ready" : "starting";
+			return publication.socketPath;
+		}, (id, address) => {
+			this.store.appendNetworkAudit({ at: now(), participantId, endpoint: id, address });
+		});
+	}
+
+	closeNetworkConnections(participantId: string): void {
+		for (const bridge of this.networkBridges.get(participantId) ?? []) bridge.closeConnections();
+	}
+
+	async publishNet(participantId: string, resourceId: string, termId: string, internalPort: number, start: () => Promise<string>, stop: () => Promise<void>): Promise<string> {
+		return this.resourceWriterGate.run(() => this.commitMutex.run(async () => {
+			this.require({ kind: "publish", participantId, resourceId, targetId: termId });
+			const resource = this.state.resources[resourceId];
+			if (resource.kind !== "net" || resource.public) throw new Error("Publication requires an exact Net endpoint");
+			if (this.publications.has(resourceId)) throw new Error("NET_ALREADY_PUBLISHED");
+			const socketPath = await start();
+			try {
+				this.persistStaged(() => this.commitEffect("publish", participantId, resourceId, undefined, termId));
+				this.publications.set(resourceId, { ownerId: participantId, termId, internalPort, socketPath, state: "starting" });
+				// A newly published route replaces external connections to this name.
+				for (const id of this.networkBridges.keys()) this.closeNetworkConnections(id);
+				return resourceId;
+			} catch (error) { await stop(); throw error; }
+		}));
+	}
+
+	async unpublishNet(participantId: string, resourceId: string, stop: (termId: string) => Promise<void>): Promise<void> {
+		await this.resourceWriterGate.run(() => this.commitMutex.run(async () => {
+			const publication = this.publications.get(resourceId);
+			if (!publication) throw new Error("NET_NOT_PUBLISHED");
+			this.require({ kind: "unpublish", participantId, resourceId, targetId: publication.termId });
+			// Persist authorization before removing a process-local route. A crash
+			// also destroys the bridge; it never recreates a published service.
+			this.persistStaged(() => this.commitEffect("unpublish", participantId, resourceId, undefined, publication.termId));
+			this.publications.delete(resourceId);
+			for (const id of this.networkBridges.keys()) this.closeNetworkConnections(id);
+			await stop(publication.termId);
+		}));
+	}
+
+	forgetTermPublications(termId: string): void {
+		let removed = false;
+		for (const [id, publication] of this.publications) if (publication.termId === termId) { this.publications.delete(id); removed = true; }
+		if (removed) for (const id of this.networkBridges.keys()) this.closeNetworkConnections(id);
+	}
+
+	private assertNetTransfer(resourceIds: string[]): void {
+		if (resourceIds.some((id) => this.publications.has(id))) throw new Error("NET_PUBLISHED: unpublish before transferring complete authority");
+	}
+
+	async materializeNet(participantId: string, input: string): Promise<string> {
+		const endpoint = netReference(input);
+		return this.commitMutex.run(() => this.persistStaged(() => {
+			const known = this.state.resources[endpoint.id];
+			if (known) return known.id;
+			const broad = this.state.resources["net:tcp/public"];
+			this.require({ kind: "net-refine", participantId, resourceId: "net:tcp/public" });
+			if (endpoint.public || !broad || this.ownerOf(broad.id) !== participantId) throw new Error(`UNAUTHORIZED_NET_REFINEMENT: ${participantId} does not own a covering Net`);
+			// DNS names are guarded on every connection; private literal IPs are
+			// never children of the public endpoint set.
+			if (!endpoint.dns && privateAddress(endpoint.host)) throw new Error("Private IP is not contained in net:tcp/public");
+			this.state.resources[endpoint.id] = { ...endpoint, kind: "net", derivedFrom: broad.id, createdAt: now() };
+			this.installComplete(participantId, endpoint.id);
+			return endpoint.id;
+		}));
 	}
 
 	get rootParticipantId(): ParticipantId { return this.state.rootParticipantId; }
@@ -471,7 +795,10 @@ export class SessionAuthorityManager {
 		this.require({ kind: "read", participantId, path });
 	}
 
-	private require(operation: AuthorityOperation): JudgmentDerivation { return requireJudgment(this.state, operation); }
+	private require(operation: AuthorityOperation): JudgmentDerivation {
+		if (this.state.archived) throw new Error("WORKSPACE_ARCHIVED: restore permissions before performing operations");
+		return requireJudgment(this.state, operation);
+	}
 
 	private applyDerivation(derivation: JudgmentDerivation): void { this.state.contexts = derivation.contexts; }
 
@@ -492,7 +819,7 @@ export class SessionAuthorityManager {
 		}
 		if (resource.kind === "file") return { identity, type: "File", stateId: resource.currentVersionId };
 		if (resource.kind === "file-region") return { identity, type: "FileRegion" };
-		return { identity, type: "Web" };
+		return { identity, type: resource.kind === "net" ? "Net" : "Web" };
 	}
 
 	private updateCompleteState(identity: string, stateId: string): void {
@@ -518,6 +845,7 @@ export class SessionAuthorityManager {
 	}
 
 	materializeWeb(participantId: ParticipantId, input: string): ResourceId {
+		if (this.state.explicitAuthority) throw new Error("Web is historical; new workspaces use typed Net resources");
 		const { id, selector } = resolveWebResourceReference(input);
 		const existing = this.state.resources[id];
 		if (existing) {
@@ -654,23 +982,34 @@ export class SessionAuthorityManager {
 		const writeExclusions = unique(writeExpressions.flatMap((expression) => expression.exclude));
 		const absent = writeExclusions.filter((path) => !existsSync(path));
 		const exactFiles = new Set(Object.values(this.state.resources).filter((resource): resource is FileResource => resource.kind === "file").map((resource) => resource.path));
-		const webDomains = participantId === this.rootParticipantId ? ["*"] : [];
-		for (const resource of Object.values(this.state.resources)) if (resource.kind === "web" && canObserveResource(this.state, participantId, resource.id)) webDomains.push(...resource.domains);
+		const webDomains: string[] = [];
+		const netEndpoints: string[] = [];
+		const netExclusions: string[] = [];
+		for (const resource of Object.values(this.state.resources)) if (resource.kind === "net") {
+			if (canObserveResource(this.state, participantId, resource.id)) netEndpoints.push(resource.id);
+			else if (!resource.public) netExclusions.push(resource.id);
+		}
+		for (const resource of Object.values(this.state.resources)) if (!this.state.explicitAuthority && resource.kind === "web" && canObserveResource(this.state, participantId, resource.id)) webDomains.push(...resource.domains);
 		return {
 			readExpressions,
 			writeExpressions,
-			readPaths: unique(readExpressions.map((expression) => expression.include)),
-			writePaths: unique(writeExpressions.map((expression) => expression.include)),
+			readPaths: unique([...readExpressions.map((expression) => expression.include), ...Object.values(this.state.resources).filter((resource): resource is FileResource => resource.kind === "file" && canReadPath(this.state, participantId, resource.path) && !readExpressions.some((expression) => pathExpressionContains(expression, resource.path))).map((resource) => resource.path)]),
+			writePaths: unique([...writeExpressions.map((expression) => expression.include), ...Object.values(this.state.resources).filter((resource): resource is FileResource => resource.kind === "file" && canWritePath(this.state, participantId, resource.path) && !writeExpressions.some((expression) => pathExpressionContains(expression, resource.path))).map((resource) => resource.path)]),
 			denyReadPaths: unique(readExpressions.flatMap((expression) => expression.exclude)),
 			denyWritePaths: writeExclusions.filter((path) => existsSync(path)),
 			absentWriteFileExclusions: absent.filter((path) => exactFiles.has(path)),
 			unsafeAbsentWriteExclusions: absent.filter((path) => !exactFiles.has(path)),
 			webDomains: unique(webDomains),
+			netEndpoints,
+			netExclusions,
 		};
 	}
 
 	/** Materialize and return the canonical base File-region identity. */
-	baseResourceId(): ResourceId { return this.materializeBaseRegion().id; }
+	baseResourceId(): ResourceId {
+		if (this.state.explicitAuthority && !this.state.resources[pathResourceId(this.base)]) throw new Error("Root is a position, not implicit File authority");
+		return this.materializeBaseRegion().id;
+	}
 
 	/**
 	 * read returns the FileState of an authorized File location: Absent is a
@@ -678,25 +1017,31 @@ export class SessionAuthorityManager {
 	 * directory has no String content to read.
 	 */
 	async readFile(participantId: ParticipantId, input: string): Promise<FileReadResult> {
+		const result = await this.readFileBytes(participantId, input);
+		return { ...result, content: result.content.toString("utf8") };
+	}
+
+	/** A single authorized published view, shared by text and image gateways. */
+	async readFileBytes(participantId: ParticipantId, input: string): Promise<Omit<FileReadResult, "content"> & { content: Buffer }> {
 		const path = resolvePublicPath(input, this.base, this.base, this.privateRoots);
 		this.require({ kind: "read", participantId, path });
 		const resource = this.fileAt(path);
 		const view = this.snapshotForActiveRead(path);
 		if (view) {
 			const content = this.store.readSnapshot(view.snapshot);
-			if (content === undefined) return { path, state: "Absent", content: "", resourceId: resource?.id, stale: true, ledgerSequence: view.ledgerSequence };
-			return { path, state: "Present", content: content.toString("utf8"), resourceId: resource?.id, stale: true, ledgerSequence: view.ledgerSequence };
+			if (content === undefined) return { path, state: "Absent", content: Buffer.alloc(0), resourceId: resource?.id, stale: true, ledgerSequence: view.ledgerSequence };
+			return { path, state: "Present", content, resourceId: resource?.id, stale: true, ledgerSequence: view.ledgerSequence };
 		}
 		if (!resource) {
-			if (!existsSync(path)) return { path, state: "Absent", content: "", stale: false, ledgerSequence: this.state.sequence };
+			if (!existsSync(path)) return { path, state: "Absent", content: Buffer.alloc(0), stale: false, ledgerSequence: this.state.sequence };
 			this.assertSafePhysicalFile(path, input);
-			return { path, state: "Present", content: readFileSync(path, "utf8"), stale: false, ledgerSequence: this.state.sequence };
+			return { path, state: "Present", content: readFileSync(path), stale: false, ledgerSequence: this.state.sequence };
 		}
 		const captured = this.store.captureWithContent(path, false, true);
 		this.assertPhysicalSnapshot(resource, captured.snapshot);
 		return captured.content === undefined
-			? { path, state: "Absent", content: "", resourceId: resource.id, stale: false, ledgerSequence: this.state.sequence }
-			: { path, state: "Present", content: captured.content.toString("utf8"), resourceId: resource.id, stale: false, ledgerSequence: this.state.sequence };
+			? { path, state: "Absent", content: Buffer.alloc(0), resourceId: resource.id, stale: false, ledgerSequence: this.state.sequence }
+			: { path, state: "Present", content: captured.content, resourceId: resource.id, stale: false, ledgerSequence: this.state.sequence };
 	}
 
 	async writeFile(participantId: ParticipantId, input: string, content: string): Promise<FileMutationResult> {
@@ -799,7 +1144,7 @@ export class SessionAuthorityManager {
 			.filter((resource): resource is FileRegionResource => resource.kind === "file-region" && isInside(path, resource.path))
 			.sort((left, right) => right.path.length - left.path.length);
 		let parent = candidates[0];
-		if (!parent && participantId === this.rootParticipantId) {
+		if (!parent && !this.state.explicitAuthority && participantId === this.rootParticipantId) {
 			parent = this.materializeBaseRegion(durable);
 		}
 		if (!parent || !usable(parent)) throw new Error(`No ${mode === "write" ? "owned" : "held"} File region covers ${input}; acquire the containing region first or pass an explicit resource ID`);
@@ -883,7 +1228,7 @@ export class SessionAuthorityManager {
 	async bash(participantId: ParticipantId, command: string, options: BashManagerOptions = {}): Promise<BashExecutionResult> {
 		return this.resourceWriterGate.run(async () => {
 			const { cwd: cwdInput, ...runOptions } = options;
-			const cwd = resolvePublicPath(cwdInput ?? this.base, this.base, this.base, this.privateRoots);
+			const cwd = resolvePublicPath(cwdInput ?? this.participantRoot(participantId), this.participantRoot(participantId), this.base, this.privateRoots);
 			const prepared = await this.commitMutex.run(() => {
 				this.require({ kind: "bash", participantId });
 				const authority = this.effectiveAuthority(participantId);
@@ -919,7 +1264,7 @@ export class SessionAuthorityManager {
 				return { authority, journal };
 			});
 			const { authority, journal } = prepared;
-			const sandbox = new DynamicSandbox(this.base, authority, this.privateRoots, [], undefined, this.sandboxTmpPath);
+			const sandbox = new DynamicSandbox(cwd, authority, this.privateRoots, [], undefined, this.sandboxTmpPath, this.networkGuard(participantId), (bridge) => this.registerNetworkBridge(participantId, bridge));
 			const chunks: Buffer[] = [];
 			let runError: unknown;
 			let initialized = false;
@@ -984,6 +1329,7 @@ export class SessionAuthorityManager {
 
 	async beginTermEpoch(start: TermEpochStart): Promise<EffectiveAuthority> {
 		return this.resourceWriterGate.run(() => this.commitMutex.run(() => {
+			if (this.state.archived) throw new Error("WORKSPACE_ARCHIVED");
 			const participant = this.state.participants[start.termId];
 			if (!participant || participant.kind !== "term") throw new Error(`PARTICIPANT_KIND_MISMATCH: ${start.termId} is not a Term`);
 			if (this.activeTermEpochs.has(start.termId)) throw new Error(`TERM_EPOCH_OPEN: ${start.termId} already has an open epoch`);
@@ -1100,7 +1446,7 @@ export class SessionAuthorityManager {
 		name: string,
 		grants: Array<{ resourceId: ResourceId; mode: "move" | "read" }>,
 		createRuntime: () => Promise<T>,
-		options: { inheritWorkspaceRead?: boolean; defaultReadRoot?: string; participantKind?: ParticipantKind } = {},
+		options: { inheritWorkspaceRead?: boolean; defaultReadRoot?: string; participantKind?: ParticipantKind; rootDir?: string } = {},
 	): Promise<T> {
 		return this.resourceWriterGate.run(async () => {
 			const participantKind = options.participantKind ?? "agent";
@@ -1123,6 +1469,8 @@ export class SessionAuthorityManager {
 					const participant: ParticipantRecord = {
 						id: childId,
 						name,
+						rootDir: resolvePublicPath(options.rootDir ?? this.state.participants[participantId].rootDir ?? this.base, this.base, this.base, this.privateRoots),
+						permissionMode: "manual",
 						kind: participantKind,
 						parentId: participantId,
 						childIds: [],
@@ -1147,14 +1495,22 @@ export class SessionAuthorityManager {
 	}
 
 	async give(participantId: ParticipantId, peerId: ParticipantId, resourceId: ResourceId, mode: "move" | "read" = "move"): Promise<ResourceId[]> {
+		return (await this.giveWithReceipt(participantId, peerId, resourceId, mode)).resources;
+	}
+
+	async giveWithReceipt(participantId: ParticipantId, peerId: ParticipantId, resourceId: ResourceId, mode: "move" | "read" = "move"): Promise<AuthorityTransferReceipt> {
 		return this.resourceWriterGate.run(() => this.commitMutex.run(() => this.persistStaged(() => {
 			this.assertNoOpenTermEpoch(participantId, "change its authority");
 			this.assertNoOpenTermEpoch(peerId, "change its authority");
 			const derivation = this.require({ kind: "give", participantId, peerId, resourceId, mode });
+			if (mode === "move") this.assertNetTransfer(derivation.affectedResources);
 			this.applyDerivation(derivation);
+			const fileUpdates = mode === "move" ? this.saveTransferredFiles(participantId, derivation.affectedResources) : [];
+			if (derivation.affectedResources.some((id) => this.state.resources[id]?.kind === "net") && mode === "move") this.closeNetworkConnections(participantId);
+			this.authorityEvents([participantId, peerId], derivation.affectedResources, fileUpdates);
 			if (mode === "read") {
 				this.commitEffect("give", participantId, resourceId, undefined, peerId);
-				return [resourceId];
+				return { resources: [resourceId], fileUpdates };
 			}
 			// give A is one atomic transfer: the runtime executes the giver's give!
 			// together with the matching recipient-side get! inside a single
@@ -1163,23 +1519,55 @@ export class SessionAuthorityManager {
 			// still recorded as two effects for conservation audits and rewind.
 			this.commitEffect("give", participantId, resourceId, undefined, peerId);
 			this.commitEffect("get", peerId, resourceId, undefined, participantId);
-			return [...derivation.affectedResources];
+			return { resources: [...derivation.affectedResources], fileUpdates };
 		})));
 	}
 
 	async get(participantId: ParticipantId, peerId: ParticipantId, resourceId: ResourceId): Promise<ResourceId[]> {
+		return (await this.getWithReceipt(participantId, peerId, resourceId)).resources;
+	}
+
+	async getWithReceipt(participantId: ParticipantId, peerId: ParticipantId, resourceId: ResourceId): Promise<AuthorityTransferReceipt> {
 		return this.resourceWriterGate.run(() => this.commitMutex.run(() => this.persistStaged(() => {
 			this.assertNoOpenTermEpoch(participantId, "change its authority");
 			this.assertNoOpenTermEpoch(peerId, "change its authority");
 			const derivation = this.require({ kind: "get", participantId, peerId, resourceId });
+			this.assertNetTransfer(derivation.affectedResources);
 			this.applyDerivation(derivation);
+			const fileUpdates = this.saveTransferredFiles(participantId, derivation.affectedResources);
+			if (derivation.affectedResources.some((id) => this.state.resources[id]?.kind === "net")) this.closeNetworkConnections(peerId);
+			this.authorityEvents([participantId, peerId], derivation.affectedResources, fileUpdates);
 			// The direct-edge policy lets a parent take what its own child owns:
 			// the runtime executes the child-side give! and parent-side get!
 			// atomically, so ownership moves immediately.
 			this.commitEffect("give", peerId, resourceId, undefined, participantId);
 			this.commitEffect("get", participantId, resourceId, undefined, peerId);
-			return [...derivation.affectedResources];
+			return { resources: [...derivation.affectedResources], fileUpdates };
 		})));
+	}
+
+	/** Keep physical bytes and import drift at the tip of each transferred File's current branch. */
+	private saveTransferredFiles(participantId: ParticipantId, resourceIds: ResourceId[]): FileTransferUpdate[] {
+		const files = resourceIds.map((id) => this.state.resources[id]).filter((resource): resource is FileResource => resource?.kind === "file");
+		this.assertNoTermWriteOverlap(files.map((file) => file.path), "save Files during authority transfer");
+		const captured = files.map((file) => ({ file, snapshot: this.store.capture(file.path, true, true) }));
+		for (const { file, snapshot } of captured) {
+			const verification = this.store.capture(file.path, false, true);
+			if (snapshot.hash !== verification.hash || snapshot.mode !== verification.mode) throw new Error(`TRANSFER_UNSTABLE_FILE: retry when external writes finish: ${file.path}`);
+		}
+		const updates: FileTransferUpdate[] = [];
+		for (const { file, snapshot } of captured) {
+			const current = this.versionNode(file, file.currentVersionId);
+			if (!current) throw new Error(`File ${file.id} has no current state`);
+			if (current.snapshot.hash !== snapshot.hash || current.snapshot.mode !== snapshot.mode) {
+				const stateId = versionId(file.id);
+				this.appendVersion(file, stateId, snapshot, participantId, "save");
+				this.commitEffect("save", participantId, file.id, stateId);
+				updates.push({ resourceId: file.id, stateId, change: "saved" });
+			} else if (file.divergence) updates.push({ resourceId: file.id, stateId: current.id, change: "verified" });
+			delete file.divergence;
+		}
+		return updates;
 	}
 
 	descendantIds(participantId: ParticipantId): ParticipantId[] {
@@ -1210,6 +1598,19 @@ export class SessionAuthorityManager {
 			const delivering = Object.values(this.state.messages).filter((message) => subtree.has(message.targetId) && message.deliveryBatchId);
 			if (delivering.length) throw new Error(`Cannot archive ${targetId} while mailbox delivery is active: ${delivering.map((message) => message.id).join(", ")}`);
 
+			const select = <T>(values: Record<string, T>, include: (value: T, id: string) => boolean): Record<string, T> => Object.fromEntries(Object.entries(values).filter(([id, value]) => include(value, id)));
+			const readable = [...subtree].flatMap((id) => this.effectiveAuthority(id).readPaths);
+			(this.state.archives ??= {})[targetId] = {
+				participants: select(this.state.participants, (_value, id) => subtree.has(id)),
+				contexts: select(this.state.contexts, (_value, id) => subtree.has(id)),
+				checkpoints: select(this.state.checkpoints, (value) => subtree.has(value.participantId)),
+				agentStates: select(this.state.agentStates, (value) => subtree.has(value.participantId)),
+				currentAgentStateIds: select(this.state.currentAgentStateIds, (_value, id) => subtree.has(id)),
+				agentBranches: select(this.state.agentBranches ?? {}, (_value, id) => subtree.has(id)),
+				messages: select(this.state.messages, (value) => subtree.has(value.targetId)),
+				files: this.scan(readable),
+			};
+			this.state.archives[targetId] = structuredClone(this.state.archives[targetId]);
 			const parentContext = this.state.contexts[participantId];
 			if (!parentContext) throw new Error(`Unknown participant context ${participantId}`);
 			const resourceIds = new Set(Object.keys(this.state.resources));
@@ -1244,10 +1645,12 @@ export class SessionAuthorityManager {
 			const retired = [...subtree].map((id) => structuredClone(this.state.participants[id]));
 			for (const id of subtree) {
 				delete this.state.currentAgentStateIds[id];
+				delete this.state.agentBranches?.[id];
 				delete this.state.contexts[id];
 				delete this.state.participants[id];
 			}
 			this.state.participants[participantId].childIds = this.state.participants[participantId].childIds.filter((id) => id !== targetId);
+			this.authorityEvents([participantId], [...resourceIds]);
 			const effect = this.commitEffect("archive", participantId, undefined, undefined, targetId);
 			for (const record of retired) this.state.participantTombstones[record.id] = {
 				...record,
@@ -1344,7 +1747,7 @@ export class SessionAuthorityManager {
 			if ((participant.kind !== "human" && participant.kind !== "agent") || (sender.kind !== "human" && sender.kind !== "agent")) throw new Error("PARTICIPANT_KIND_MISMATCH: receive is only defined between Human and Agent participants");
 			if (!hasOrdinaryParticipantPointer(this.state, participantId, senderId)) throw new Error(`ROLE_FORGERY: ${participantId} has no ordinary participant pointer to ${senderId}`);
 		}
-		return this.liveMessages(participantId).filter((message) => (!senderId || message.senderId === senderId) && (!kind || message.kind === kind) && !message.deliveryBatchId).sort(compareMessages).map((message) => structuredClone(message));
+		return this.liveMessages(participantId).filter((message) => (!senderId || message.senderId === senderId) && (!kind || (message.kind === kind && !message.deferred)) && !message.deliveryBatchId).sort(compareMessages).map((message) => structuredClone(message));
 	}
 
 	async receive(participantId: ParticipantId, senderId: ParticipantId, messageId: string): Promise<MessageRecord> {
@@ -1390,7 +1793,7 @@ export class SessionAuthorityManager {
 	async claimPendingMessages(participantId: ParticipantId, kind: MessageKind, batchId: string): Promise<MessageRecord[]> {
 		return this.commitMutex.run(() => {
 			if (!this.state.participants[participantId]) throw new Error(`Unknown participant ${participantId}`);
-			const messages = this.liveMessages(participantId).filter((message) => message.kind === kind && !message.deliveryBatchId).sort(compareMessages);
+			const messages = this.liveMessages(participantId).filter((message) => message.kind === kind && !message.deferred && !message.deliveryBatchId).sort(compareMessages);
 			if (!messages.length) return [];
 			requireReceiveJudgments(this.state, messages.map((message) => ({ kind: "receive", participantId, senderId: message.senderId, messageId: message.id, filtered: false })));
 			const queuedAt = now();
@@ -1556,9 +1959,38 @@ export class SessionAuthorityManager {
 		return structuredClone(this.state.agentStates[stateId]);
 	}
 
+	agentBranches(targetId: ParticipantId): AgentBranches {
+		if (this.state.participants[targetId]?.kind !== "agent") throw new Error(`PARTICIPANT_KIND_MISMATCH: branches require an Agent (${targetId})`);
+		return structuredClone(this.state.agentBranches?.[targetId] ?? legacyAgentBranches(this.state.currentAgentStateIds[targetId]));
+	}
+
+	requireNewAgentBranch(targetId: ParticipantId, name: string): void {
+		if (!validAgentBranchName(name)) throw new Error("INVALID_AGENT_BRANCH_NAME: use 1–128 characters without whitespace or control characters");
+		if (Object.hasOwn(this.agentBranches(targetId).heads, name)) throw new Error(`AGENT_BRANCH_EXISTS: ${name}`);
+	}
+
+	agentBranchHead(targetId: ParticipantId, name: string): VersionId {
+		const branches = this.agentBranches(targetId);
+		if (!Object.hasOwn(branches.heads, name)) throw new Error(`UNKNOWN_AGENT_BRANCH: ${name}`);
+		return branches.heads[name];
+	}
+
 	async commitRewind(participantId: ParticipantId, targetId: ParticipantId, stateId: VersionId): Promise<EffectRecord> {
+		return this.commitAgentNavigation(participantId, targetId, stateId);
+	}
+
+	/** Branches are context references; the existing rewind judgment/effect governs navigation. */
+	async commitAgentNavigation(participantId: ParticipantId, targetId: ParticipantId, stateId: VersionId, branch?: { name: string; create: boolean }): Promise<EffectRecord> {
 		return this.commitMutex.run(() => this.persistStaged(() => {
-			this.require({ kind: "rewind", participantId, targetId, stateId });
+			this.requireRewind(participantId, targetId, stateId);
+			const branches = this.agentBranches(targetId);
+			if (branch) {
+				if (branch.create) this.requireNewAgentBranch(targetId, branch.name);
+				else if (this.agentBranchHead(targetId, branch.name) !== stateId) throw new Error(`AGENT_BRANCH_CHANGED: ${branch.name}`);
+				branches.current = branch.name;
+			}
+			branches.heads = { ...branches.heads, [branches.current]: stateId };
+			(this.state.agentBranches ??= {})[targetId] = branches;
 			this.state.currentAgentStateIds[targetId] = stateId;
 			this.updateCompleteState(targetId, stateId);
 			return this.commitEffect("rewind", participantId, undefined, stateId, targetId);
@@ -1578,7 +2010,7 @@ export class SessionAuthorityManager {
 		};
 	}
 
-	async recordCheckpoint(envelope: CheckpointEnvelope, piEntryId: string, parentPiEntryId?: string, parentStateId?: VersionId): Promise<AgentStateNode> {
+	async recordCheckpoint(envelope: CheckpointEnvelope, piEntryId: string, parentPiEntryId?: string, parentStateId?: VersionId, advanceCurrent = true): Promise<AgentStateNode> {
 		return this.commitMutex.run(() => this.persistStaged(() => {
 			if (this.state.participants[envelope.participantId]?.kind !== "agent") throw new Error(`PARTICIPANT_KIND_MISMATCH: typed Pi checkpoints belong only to Agent participants (${envelope.participantId})`);
 			const checkpoint: TypedCheckpoint = { ...envelope, piEntryId };
@@ -1595,8 +2027,13 @@ export class SessionAuthorityManager {
 				createdAt: now(),
 			};
 			this.state.agentStates[node.id] = node;
-			this.state.currentAgentStateIds[envelope.participantId] = node.id;
-			this.updateCompleteState(envelope.participantId, node.id);
+			if (advanceCurrent) {
+				const branches = this.agentBranches(envelope.participantId);
+				branches.heads = { ...branches.heads, [branches.current]: node.id };
+				(this.state.agentBranches ??= {})[envelope.participantId] = branches;
+				this.state.currentAgentStateIds[envelope.participantId] = node.id;
+				this.updateCompleteState(envelope.participantId, node.id);
+			}
 			return structuredClone(node);
 		}));
 	}
@@ -1632,7 +2069,7 @@ export class SessionAuthorityManager {
 	resourceLog(participantId: ParticipantId, resourceId: ResourceId): Array<{ id: string; parent?: string; summary: string; current: boolean }> {
 		this.requireLogResource(participantId, resourceId);
 		const resource = this.state.resources[resourceId];
-		if (resource.kind !== "file") return [{ id: resource.id, summary: `${resource.kind}:${resource.kind === "file-region" ? resource.path : resource.domains.join(",")}`, current: true }];
+		if (resource.kind !== "file") return [{ id: resource.id, summary: `${resource.kind}:${resource.kind === "file-region" ? resource.path : resource.kind === "net" ? resource.id : resource.domains.join(",")}`, current: true }];
 		return resource.versions.map((node) => ({ id: node.id, parent: node.parentId, summary: `${node.operation} ${node.snapshot.exists ? node.snapshot.hash.slice(0, 12) : "absent"}`, current: node.id === resource.currentVersionId }));
 	}
 
@@ -1667,7 +2104,7 @@ export class SessionAuthorityManager {
 		const lines = [
 			"[Runtime rewind notice]",
 			"",
-			`Context was moved to ${stateId}; only Agent context changed.`,
+			`Context was moved to ${stateId} on branch ${this.agentBranches(targetId).current}; only Agent context changed.`,
 			`The complete ledger interval after checkpoint sequence ${checkpoint.ledgerSequence} and before rewind sequence ${rewindEffectSequence} follows.`,
 			"",
 			"Effects not reverted:",
@@ -1684,7 +2121,7 @@ export class SessionAuthorityManager {
 		if (effect.targetId) fields.push(`target=${effect.targetId}`);
 		if (effect.resourceId) fields.push(`resource=${effect.resourceId}`);
 		if (effect.stateId) fields.push(`state=${effect.stateId}`);
-		let consequence: string;
+		let consequence = "runtime state transition remains committed";
 		switch (effect.kind) {
 			case "participants":
 				consequence = "discovered ordinary participant pointers remain available; no resource or lineage authority was granted";
@@ -1695,16 +2132,16 @@ export class SessionAuthorityManager {
 				if (spawned) {
 					const authority = this.authoritySnapshot(spawned.id);
 					const web = [...authority.owned, ...authority.pointers]
-						.filter((resourceId, index, all) => all.indexOf(resourceId) === index && this.state.resources[resourceId]?.kind === "web");
-					consequence = `spawned ${spawned.kind} remains live (${spawned.status}); current own/write=${authority.owned.join(",") || "none"}; current read=${authority.pointers.join(",") || "none"}; current Web authority=${web.join(",") || "none"}`;
+						.filter((resourceId, index, all) => all.indexOf(resourceId) === index && (this.state.resources[resourceId]?.kind === "web" || this.state.resources[resourceId]?.kind === "net"));
+					consequence = `spawned ${spawned.kind} remains live (${spawned.status}); current own/write=${authority.owned.join(",") || "none"}; current read=${authority.pointers.join(",") || "none"}; current Net authority=${web.join(",") || "none"}`;
 				} else if (retired) consequence = `spawned ${retired.kind} remains archived; the later archive effect is not undone`;
 				else consequence = "spawned participant remains part of durable history; its creation is not undone";
 				break;
 			}
 			case "give":
 			case "get":
-				consequence = effect.resourceId && this.state.resources[effect.resourceId]?.kind === "web"
-					? "Web/network authority transfer remains committed; this records permission topology, not whether a request occurred"
+				consequence = effect.resourceId && (this.state.resources[effect.resourceId]?.kind === "web" || this.state.resources[effect.resourceId]?.kind === "net")
+					? "Net/network authority transfer remains committed; this records permission topology, not whether a request occurred"
 					: "resource authority transfer remains committed";
 				break;
 			case "send":
@@ -1794,7 +2231,7 @@ export class SessionAuthorityManager {
 		let parent = parentResource ?? Object.values(this.state.resources)
 			.filter((resource): resource is FileRegionResource => resource.kind === "file-region" && isInside(path, resource.path) && this.ownerOf(resource.id) === participantId)
 			.sort((left, right) => right.path.length - left.path.length)[0];
-		if (!parent && participantId === this.rootParticipantId && isInside(path, this.base)) parent = this.materializeBaseRegion(false);
+		if (!parent && !this.state.explicitAuthority && participantId === this.rootParticipantId && isInside(path, this.base)) parent = this.materializeBaseRegion(false);
 		if (!parent || !this.ownerOf(parent.id)) throw new Error(`Cannot materialize ${path} without a held File region`);
 		const id = fileResourceId(path, false);
 		const snapshot = initialSnapshot ?? this.store.capture(path, true);
@@ -1905,7 +2342,7 @@ export class SessionAuthorityManager {
 		for (const path of changedPaths) {
 			const expectedPostHash = journal.after[path]?.hash ?? absentHash;
 			const resource = this.fileAt(path);
-			const allowedOperations = journal.operation === "term" ? new Set(["term"]) : new Set(["bash", "recovery"]);
+			const allowedOperations = journal.operation === "term" ? new Set(["term"]) : new Set(["bash", "recovery", "save"]);
 			const recorded = resource?.versions.some((version) => version.snapshot.hash === expectedPostHash
 				&& version.participantId === journal.participantId
 				&& allowedOperations.has(version.operation));
@@ -1932,8 +2369,8 @@ export class SessionAuthorityManager {
 
 	private commitBashJournal(
 		journal: BashJournal,
-		versionOperation: "bash" | "term" | "recovery",
-		effectKind: "bash" | "exec",
+		versionOperation: "bash" | "term" | "recovery" | "save",
+		effectKind: "bash" | "exec" | "save",
 		targetId: ParticipantId | undefined,
 		status: "committed" | "diverged",
 		divergencePaths: readonly string[] = [],
@@ -1975,6 +2412,7 @@ export class SessionAuthorityManager {
 			for (const path of divergencePaths) this.markPlaceholderDivergence(path);
 			const changed = this.reconcileBash(journal, versionOperation);
 			this.commitEffect(effectKind, journal.participantId, undefined, undefined, targetId, status, journal.effectId);
+			if (journal.operation === "save") this.state.saveBaseline = { ...this.state.saveBaseline, ...journal.after };
 			if (termEpochRecord) {
 				if (this.state.termEpochs[termEpochRecord.id] || Object.values(this.state.termEpochs).some((epoch) => epoch.effectId === termEpochRecord.effectId)) throw new Error(`TERM_EPOCH_LOG_DUPLICATE: ${journal.id}`);
 				this.state.termEpochs[termEpochRecord.id] = structuredClone(termEpochRecord);
@@ -1988,13 +2426,13 @@ export class SessionAuthorityManager {
 		}
 	}
 
-	private reconcileBash(journal: BashJournal, operation: "bash" | "term" | "recovery"): ResourceId[] {
+	private reconcileBash(journal: BashJournal, operation: "bash" | "term" | "recovery" | "save"): ResourceId[] {
 		const after = journal.after ?? this.scan(journal.roots, journal.exclusions ?? [], true);
 		const changed: ResourceId[] = [];
 		for (const path of unique([...Object.keys(journal.before), ...Object.keys(after)]).sort()) {
 			const before = journal.before[path] ?? { exists: false, hash: hashBuffer("linden:absent:v1") };
 			const next = after[path] ?? { exists: false, hash: hashBuffer("linden:absent:v1") };
-			if (before.hash === next.hash) continue;
+			if (before.hash === next.hash && before.mode === next.mode) continue;
 			const resource = this.fileAt(path) ?? this.materializeFile(path, journal.participantId, before, undefined, "write", false);
 			const current = this.versionNode(resource, resource.currentVersionId)?.snapshot;
 			if (current && current.hash !== before.hash) {
@@ -2012,11 +2450,11 @@ export class SessionAuthorityManager {
 		const result: Record<string, SnapshotRef> = {};
 		const files = new Map<string, { inodeKey: string; links: number }>();
 		const visited = new Set<string>();
-		const visit = (path: string) => {
+		const visit = (path: string, explicit = false) => {
 			if (visited.has(path)) return;
 			visited.add(path);
 			if (exclusions.some((excluded) => path === excluded || isInside(path, excluded))) return;
-			if (isInside(path, this.stateDir) || this.ignoredNames.has(basename(path))) return;
+			if (this.privateRoots.some((root) => isInside(path, root)) || (!explicit && this.ignoredNames.has(basename(path)))) return;
 			if (!existsSync(path)) return;
 			const stat = lstatSync(path, { bigint: true });
 			if (stat.isSymbolicLink()) return;
@@ -2024,7 +2462,15 @@ export class SessionAuthorityManager {
 			if (!stat.isDirectory()) return;
 			for (const name of readdirSync(path)) visit(join(path, name));
 		};
-		for (const root of unique(roots)) visit(root);
+		for (const root of unique(roots)) visit(root, true);
+		// Cache directories are omitted from discovery, but never hide an already
+		// registered File that falls within this operation's authority.
+		for (const resource of Object.values(this.state.resources)) {
+			if (resource.kind === "file" && roots.some((root) => resource.path === root || isInside(resource.path, root))) {
+				visited.delete(resource.path);
+				visit(resource.path, true);
+			}
+		}
 		if (rejectHardlinks) {
 			const groups = new Map<string, { links: number; paths: string[] }>();
 			for (const [path, file] of files) {
@@ -2072,7 +2518,7 @@ export class SessionAuthorityManager {
 							trace: this.store.captureBuffer(Buffer.from(JSON.stringify(trace)), 0o600),
 						};
 					}
-					this.commitBashJournal(journal, term ? "term" : "recovery", term ? "exec" : "bash", term ? journal.participantId : undefined, status, cleanup.violations.map((violation) => violation.path), term ? journal.participantId : undefined, termEpochRecord);
+					this.commitBashJournal(journal, term ? "term" : journal.operation === "save" ? "save" : "recovery", term ? "exec" : journal.operation === "save" ? "save" : "bash", term ? journal.participantId : undefined, status, cleanup.violations.map((violation) => violation.path), term ? journal.participantId : undefined, termEpochRecord);
 					this.removeCommittedJournal(journal.id); continue;
 				}
 				const resource = this.state.resources[journal.resourceId];
@@ -2098,7 +2544,7 @@ export class SessionAuthorityManager {
 	private spawnGrants(participantId: ParticipantId, explicit: Array<{ resourceId: ResourceId; mode: "move" | "read" }>, inheritRead: boolean, defaultReadRoot?: string): Array<{ resourceId: ResourceId; mode: "move" | "read" }> {
 		const byResource = new Map<ResourceId, "move" | "read">();
 		if (inheritRead) {
-			if (participantId === this.rootParticipantId) {
+			if (participantId === this.rootParticipantId && canReadPath(this.state, participantId, defaultReadRoot ?? this.base)) {
 				const root = resolvePublicPath(defaultReadRoot ?? this.base, this.base, this.base, this.privateRoots);
 				let region = Object.values(this.state.resources).find((resource): resource is FileRegionResource => resource.kind === "file-region" && resource.path === root);
 				if (!region) {
@@ -2114,7 +2560,7 @@ export class SessionAuthorityManager {
 				byResource.set(region.id, "read");
 			} else {
 				for (const resource of Object.values(this.state.resources)) {
-					if ((resource.kind === "file" || resource.kind === "file-region") && isInside(resource.path, this.base) && canReadPath(this.state, participantId, resource.path)) {
+					if ((resource.kind === "file" || resource.kind === "file-region") && (participantId !== this.rootParticipantId || isInside(resource.path, defaultReadRoot ?? this.base)) && canReadPath(this.state, participantId, resource.path)) {
 						byResource.set(resource.id, "read");
 					}
 				}
@@ -2207,7 +2653,7 @@ export class SessionAuthorityManager {
 
 	private latestAgentState(participantId: ParticipantId): AgentStateNode | undefined {
 		const current = this.state.agentStates[this.state.currentAgentStateIds[participantId]];
-		return current ?? Object.values(this.state.agentStates).filter((node) => node.participantId === participantId).sort((left, right) => right.createdAt - left.createdAt)[0];
+		return current;
 	}
 
 	private snapshotForActiveRead(path: string): { snapshot: SnapshotRef; ledgerSequence: number } | undefined {

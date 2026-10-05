@@ -33,7 +33,7 @@ export interface DeltaContext {
 
 export interface CompleteValue {
 	identity: string;
-	type: "File" | "FileRegion" | "Web" | "Human" | "Agent" | "Term" | "Message";
+	type: "File" | "FileRegion" | "Web" | "Net" | "Human" | "Agent" | "Term" | "Message";
 	/** Current node of the corresponding versioned ADT, when versioned. */
 	stateId?: string;
 }
@@ -58,7 +58,8 @@ export interface JudgmentParticipant {
 
 export interface JudgmentResource {
 	id: ResourceId;
-	kind: "file" | "file-region" | "web";
+	kind: "file" | "file-region" | "web" | "net";
+	public?: boolean;
 	path?: string;
 	domains?: string[];
 	derivedFrom?: ResourceId;
@@ -84,6 +85,8 @@ export interface JudgmentAgentState {
 
 export interface JudgmentState {
 	base: string;
+	explicitAuthority?: boolean;
+	archived?: boolean;
 	rootParticipantId: ParticipantId;
 	contexts: Record<ParticipantId, ParticipantContext>;
 	participants: Record<ParticipantId, JudgmentParticipant>;
@@ -95,6 +98,8 @@ export interface JudgmentState {
 }
 
 export type Judgment =
+	| { kind: "connect" | "net-refine"; participantId: ParticipantId; resourceId: ResourceId }
+	| { kind: "publish" | "unpublish"; participantId: ParticipantId; resourceId: ResourceId; targetId: ParticipantId }
 	| { kind: "participants"; participantId: ParticipantId }
 	| { kind: "read"; participantId: ParticipantId; path: string }
 	| { kind: "write" | "edit"; participantId: ParticipantId; path: string }
@@ -192,6 +197,7 @@ export function pathInside(candidate: string, root: string): boolean {
 	return value === parent || value.startsWith(parent === "/" ? "/" : `${parent}/`);
 }
 
+/** True when every host selected by `child` is selected by `parent` (legacy Web selectors). */
 export function hostSelectorContains(parent: string, child: string): boolean {
 	const broad = parent.toLowerCase().replace(/\.$/, "");
 	const narrow = child.toLowerCase().replace(/\.$/, "");
@@ -287,7 +293,7 @@ export function canReadPath(state: JudgmentState, participantId: ParticipantId, 
 	const matching = Object.values(state.resources)
 		.filter((resource) => resource.kind === "file-region" && resource.path && pathInside(path, resource.path));
 	if (matching.some((resource) => canObserveResource(state, participantId, resource.id))) return true;
-	return participantId === state.rootParticipantId && pathInside(path, state.base);
+	return !state.explicitAuthority && !state.archived && participantId === state.rootParticipantId && pathInside(path, state.base);
 }
 
 export function canWritePath(state: JudgmentState, participantId: ParticipantId, path: string): boolean {
@@ -304,7 +310,7 @@ export function canWritePath(state: JudgmentState, participantId: ParticipantId,
 		.sort((left, right) => (right.path?.length ?? 0) - (left.path?.length ?? 0));
 	const mostSpecificLength = matching[0]?.path?.length;
 	if (mostSpecificLength !== undefined) return matching.some((resource) => resource.path?.length === mostSpecificLength && ownerOf(state, resource.id) === participantId);
-	return participantId === state.rootParticipantId && pathInside(path, state.base);
+	return !state.explicitAuthority && !state.archived && participantId === state.rootParticipantId && pathInside(path, state.base);
 }
 
 function hasParticipantPointer(state: JudgmentState, participantId: ParticipantId, targetId: ParticipantId): boolean {
@@ -338,6 +344,7 @@ function directEdge(state: JudgmentState, left: ParticipantId, right: Participan
 }
 
 function containedMoveSet(state: JudgmentState, resource: JudgmentResource, ownerId: ParticipantId): ResourceId[] {
+	if (resource.kind === "net" && resource.public) return [resource.id, ...Object.values(state.resources).filter((candidate) => candidate.kind === "net" && !candidate.public && candidate.derivedFrom === resource.id && ownerOf(state, candidate.id) === ownerId).map((candidate) => candidate.id)];
 	if (resource.kind === "web") {
 		const selector = resource.domains?.[0] ?? "";
 		return [resource.id, ...Object.values(state.resources)
@@ -440,6 +447,7 @@ function applyReceiveJudgment(state: JudgmentState, operation: ReceiveJudgment, 
 
 /** Thread a sequence of receive judgments through one Γ/Δ clone. */
 export function deriveReceiveJudgments(state: JudgmentState, operations: readonly ReceiveJudgment[]): JudgmentResult {
+	if (state.archived && operations.length) return reject(operations[0], "PARTICIPANT_STATUS_MISMATCH", "Workspace is archived");
 	if (!operations.length) throw new Error("deriveReceiveJudgments requires at least one Judgment");
 	const participantId = operations[0].participantId;
 	const participant = state.participants[participantId];
@@ -456,6 +464,7 @@ export function deriveReceiveJudgments(state: JudgmentState, operations: readonl
 }
 
 export function deriveJudgment(state: JudgmentState, operation: Judgment): JudgmentResult {
+	if (state.archived) return reject(operation, "PARTICIPANT_STATUS_MISMATCH", "Workspace is archived");
 	const participant = state.participants[operation.participantId];
 	if (!participant || !state.contexts[operation.participantId]) return reject(operation, "UNKNOWN_PARTICIPANT", `Unknown participant ${operation.participantId}`);
 	// Most judgments inspect Γ/Δ without changing them. Preserve the existing
@@ -465,6 +474,18 @@ export function deriveJudgment(state: JudgmentState, operation: Judgment): Judgm
 		: state.contexts;
 
 	switch (operation.kind) {
+		case "connect":
+		case "net-refine":
+		case "publish":
+		case "unpublish": {
+			const resource = state.resources[operation.resourceId];
+			if (!resource || resource.kind !== "net") return reject(operation, "UNKNOWN_RESOURCE", "Expected a Net resource", operation.resourceId);
+			if (operation.kind === "connect" ? !canObserveResource(state, participant.id, resource.id) : ownerOf(state, resource.id) !== participant.id) return reject(operation, "UNAUTHORIZED_WRITE", `${operation.kind} requires ${operation.kind === "connect" ? "Net or &Net" : "complete Net"}`, resource.id);
+			if (operation.kind === "publish" || operation.kind === "unpublish") {
+				if (state.participants[operation.targetId]?.kind !== "term" || !isStrictAncestor(state, participant.id, operation.targetId)) return reject(operation, "ROLE_MISMATCH", "Publication requires control of a descendant Term", resource.id, operation.targetId);
+			}
+			return result(operation, contexts, { effect: "IO", affectedResources: [resource.id] });
+		}
 		case "read":
 		case "stat": {
 			const resource = resolveFile(state, operation.path);
@@ -495,12 +516,13 @@ export function deriveJudgment(state: JudgmentState, operation: Judgment): Judgm
 				const resource = state.resources[grant.resourceId];
 				if (!resource) return reject(operation, "UNKNOWN_RESOURCE", `Unknown resource ${grant.resourceId}`, grant.resourceId);
 				if (grant.mode === "read") {
-					if (!canObserveResource(state, participant.id, resource.id)) return reject(operation, "UNAUTHORIZED_READ", `${participant.id} cannot share pointer ${resource.id}`, resource.id);
+					if ((resource.kind === "net" && ownerOf(state, resource.id) !== participant.id) || !canObserveResource(state, participant.id, resource.id)) return reject(operation, "UNAUTHORIZED_READ", `${participant.id} cannot share pointer ${resource.id}`, resource.id);
 					addPointer(contexts, operation.childId, resource.id);
 				} else {
 					if (ownerOf(state, resource.id) !== participant.id) return reject(operation, "UNAUTHORIZED_WRITE", `${participant.id} does not hold ${resource.id}`, resource.id);
 					const moved = containedMoveSet(state, resource, participant.id);
 					moveComplete(contexts, moved, participant.id, operation.childId);
+					if (resource.kind === "net") contexts[participant.id].gamma.resourcePointers = contexts[participant.id].gamma.resourcePointers.filter((id) => !moved.includes(id));
 					affected.push(...moved);
 				}
 			}
@@ -564,13 +586,14 @@ export function deriveJudgment(state: JudgmentState, operation: Judgment): Judgm
 			const resource = state.resources[operation.resourceId];
 			if (!resource) return reject(operation, "UNKNOWN_RESOURCE", `Unknown resource ${operation.resourceId}`, operation.resourceId);
 			if (operation.mode === "read") {
-				if (!canObserveResource(state, participant.id, resource.id)) return reject(operation, "UNAUTHORIZED_READ", `${participant.id} has no pointer to ${resource.id}`, resource.id);
+				if ((resource.kind === "net" && ownerOf(state, resource.id) !== participant.id) || !canObserveResource(state, participant.id, resource.id)) return reject(operation, "UNAUTHORIZED_READ", `${participant.id} has no pointer to ${resource.id}`, resource.id);
 				addPointer(contexts, operation.peerId, resource.id);
 				return result(operation, contexts, { affectedResources: [resource.id], targetId: operation.peerId });
 			}
 			if (ownerOf(state, resource.id) !== participant.id) return reject(operation, "UNAUTHORIZED_WRITE", `${participant.id} does not own ${resource.id}`, resource.id);
 			const moved = containedMoveSet(state, resource, participant.id);
 			moveComplete(contexts, moved, participant.id, operation.peerId);
+			if (resource.kind === "net") contexts[participant.id].gamma.resourcePointers = contexts[participant.id].gamma.resourcePointers.filter((id) => !moved.includes(id));
 			return result(operation, contexts, { affectedResources: moved, targetId: operation.peerId });
 		}
 		case "get": {
@@ -580,6 +603,7 @@ export function deriveJudgment(state: JudgmentState, operation: Judgment): Judgm
 			if (ownerOf(state, resource.id) !== operation.peerId) return reject(operation, "ROLE_MISMATCH", `${operation.peerId} does not own ${resource.id}`, resource.id, operation.peerId);
 			const moved = containedMoveSet(state, resource, operation.peerId);
 			moveComplete(contexts, moved, operation.peerId, participant.id);
+			if (resource.kind === "net") contexts[operation.peerId].gamma.resourcePointers = contexts[operation.peerId].gamma.resourcePointers.filter((id) => !moved.includes(id));
 			return result(operation, contexts, { resultType: "Resource", affectedResources: moved, targetId: operation.peerId });
 		}
 		case "archive": {
@@ -711,7 +735,7 @@ export function pathExpressions(state: JudgmentState, participantId: Participant
 		.filter((candidate) => candidate.path !== region.path && candidate.path && pathInside(candidate.path, region.path!))
 		.filter((candidate) => !(writable ? canWritePath(state, participantId, candidate.path!) : canReadPath(state, participantId, candidate.path!)))
 		.map((candidate) => candidate.path!)));
-	if (participantId === state.rootParticipantId && !expressions.some((expression) => expression.include === state.base)) {
+	if (!state.explicitAuthority && !state.archived && participantId === state.rootParticipantId && !expressions.some((expression) => expression.include === state.base)) {
 		expressions.unshift(normalizePathExpression(state.base, resources
 			.filter((resource) => resource.path && !(writable ? ownerOf(state, resource.id) === participantId : canObserveResource(state, participantId, resource.id)))
 			.map((resource) => resource.path!)));
@@ -731,7 +755,8 @@ export function assertWellFormedContexts(state: JudgmentState): void {
 	const values = new Map<string, CompleteValue>();
 	for (const [participantId, context] of Object.entries(state.contexts)) {
 		const participant = state.participants[participantId];
-		if (!participant) throw new Error(`Context exists for unknown participant ${participantId}`);
+		if (!participant && participantId !== "environment") throw new Error(`Context exists for unknown participant ${participantId}`);
+		if (participantId === "environment" && (context.gamma.roles.length || context.gamma.agentPointers.length || context.gamma.resourcePointers.length)) throw new Error("Environment cannot hold participant capabilities");
 		if (unique(context.delta.completeValues.map((value) => value.identity)).length !== context.delta.completeValues.length) throw new Error(`Δ for ${participantId} contains duplicate complete values`);
 		const roleKeys = context.gamma.roles.map((role) => `${role.role}\0${role.targetId}`);
 		if (unique(roleKeys).length !== roleKeys.length) throw new Error(`Γ for ${participantId} contains duplicate participant roles`);
@@ -745,6 +770,7 @@ export function assertWellFormedContexts(state: JudgmentState): void {
 			owners.set(identity, participantId);
 			values.set(identity, value);
 		}
+		if (!participant) continue;
 		const self = values.get(participantId);
 		const expectedSelfType = completeParticipantType(participant.kind);
 		if (!self || self.type !== expectedSelfType || owners.get(participantId) !== participantId) throw new Error(`Participant ${participantId} must self-hold a complete ${expectedSelfType}`);
@@ -818,7 +844,7 @@ export function assertWellFormedContexts(state: JudgmentState): void {
 	}
 	for (const resource of Object.values(state.resources)) {
 		const value = values.get(resource.id)!;
-		const expectedType = resource.kind === "file" ? "File" : resource.kind === "file-region" ? "FileRegion" : "Web";
+		const expectedType = resource.kind === "file" ? "File" : resource.kind === "file-region" ? "FileRegion" : resource.kind === "net" ? "Net" : "Web";
 		if (value.type !== expectedType) throw new Error(`Complete ${resource.id} has type ${value.type}, expected ${expectedType}`);
 		if (resource.kind === "file" && value.stateId !== resource.currentVersionId) throw new Error(`Δ/Σ disagreement for ${resource.id}: ${String(value.stateId)} != ${String(resource.currentVersionId)}`);
 	}

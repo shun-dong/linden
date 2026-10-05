@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
 import { ChildParticipantRuntime, PiCoordinator } from "../src/pi/runtime.js";
 
 test("&>> grants ancestor listen/send/steer/stop/log while rewind and siblings stay restricted", async () => {
@@ -92,6 +92,7 @@ test("get preserves a running child loop and delivers the committed authority ch
 		const owned = await manager.writeFile(human, "owned.txt", "owned");
 		await manager.give(human, parent, owned.resourceId);
 		await manager.give(parent, child, owned.resourceId);
+		for (const event of manager.snapshot().runtimeEvents ?? []) await manager.acknowledgeRuntimeEvent(event.id);
 		coordinator = PiCoordinator.createStandalone(manager);
 		let aborts = 0;
 		const notices: string[] = [];
@@ -102,7 +103,7 @@ test("get preserves a running child loop and delivers the committed authority ch
 			abort: async () => { aborts += 1; },
 			summary: () => child,
 			appendRuntimeNotice: async (text: string, options?: { continueLoop?: boolean; kind?: "rewind" | "authority-change" }) => {
-				assert.equal(options?.continueLoop, true);
+				assert.equal(options?.continueLoop, false);
 				assert.equal(options?.kind, "authority-change");
 				notices.push(text);
 				await continuedTurn;
@@ -123,6 +124,8 @@ test("get preserves a running child loop and delivers the committed authority ch
 		assert.deepEqual(await getting, [owned.resourceId], "get returns after committing, not after the resumed Agent turn ends");
 		assert.equal(manager.resource(owned.resourceId)?.ownerId, parent);
 		assert.equal(aborts, 0);
+		const noticeDeadline = Date.now() + 2000;
+		while (!notices.length && Date.now() < noticeDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
 		assert.equal(notices.length, 1);
 		assert.match(notices[0], /authority update/);
 		assert.ok(notices[0].includes(owned.resourceId));
@@ -148,6 +151,7 @@ test("get appends an authority update to an idle child without starting another 
 		const owned = await manager.writeFile(human, "idle-owned.txt", "owned");
 		await manager.give(human, parent, owned.resourceId);
 		await manager.give(parent, child, owned.resourceId);
+		for (const event of manager.snapshot().runtimeEvents ?? []) await manager.acknowledgeRuntimeEvent(event.id);
 		coordinator = PiCoordinator.createStandalone(manager);
 		let aborts = 0;
 		const notices: Array<{ text: string; options: any }> = [];
@@ -166,8 +170,10 @@ test("get appends an authority update to an idle child without starting another 
 		assert.equal(manager.resource(owned.resourceId)?.ownerId, parent);
 		assert.equal(aborts, 0);
 		assert.equal(notices.length, 1);
-		assert.match(notices[0].text, /When you next run, continue your task/);
-		assert.deepEqual(notices[0].options, { continueLoop: false, kind: "authority-change" });
+		assert.match(notices[0].text, /authority update/);
+		assert.equal(notices[0].options.continueLoop, false);
+		assert.equal(notices[0].options.kind, "authority-change");
+		assert.match(notices[0].options.eventId, /^runtime:/);
 	} finally {
 		await coordinator?.dispose();
 		rmSync(workspace, { recursive: true, force: true });
@@ -244,6 +250,7 @@ test("idle rewind leaves an already-pending mailbox dormant", async () => {
 		await manager.spawnWith(parent, child, "rewind-idle-mailbox-child", [], async () => ({ piSessionId: "rewind-idle-mailbox-child" }));
 		const checkpoint = await manager.recordCheckpoint(manager.checkpointEnvelope(child), "pi:idle-mailbox-target");
 		await manager.sendWithPayload(human, child, async (messageId) => manager.store.writePrivatePayload(`test:${messageId}`, { messageId, senderId: human, payload: "remain dormant" }));
+		for (const event of manager.snapshot().runtimeEvents ?? []) await manager.acknowledgeRuntimeEvent(event.id);
 		coordinator = PiCoordinator.createStandalone(manager);
 		let aborts = 0;
 		let deliveries = 0;

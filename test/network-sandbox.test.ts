@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { sandboxRequirements } from "./runtime-requirements.js";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
 
-const hasBwrap = spawnSync("which", ["bwrap"], { stdio: "ignore" }).status === 0;
+const sandboxRuntime = await sandboxRequirements();
 
-test("Bash has no network path without Web authority", { skip: !hasBwrap }, async () => {
+test("Bash has no network path without Web authority", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-no-web-"));
 	try {
 		const manager = await SessionAuthorityManager.open({ workspace, sessionId: "no-web", stateDir: join(workspace, ".linden-test") });

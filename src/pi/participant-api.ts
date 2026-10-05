@@ -55,10 +55,6 @@ export interface ParticipantCoordinatorApi {
 	termInput(callerId: ParticipantId, target: string, data: string): Promise<void>;
 }
 
-export function participantCoordinator(coordinator: ParticipantCoordinatorApi): ParticipantCoordinatorApi {
-	return coordinator;
-}
-
 export interface ParticipantReference {
 	participant?: string;
 	/** Deprecated compatibility alias for participant. */

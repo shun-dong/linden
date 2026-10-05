@@ -81,18 +81,16 @@ export function canonicalBase(path: string): string {
 	return result;
 }
 
-/**
- * Resolve a public File address relative to cwd, then enforce the immutable
- * session base and the private Linden state boundary.
- */
+/** Resolve a public File address relative to cwd and enforce the private state boundary. */
 export function resolvePublicPath(input: string, cwd: string, baseOrPrivateRoots: string | string[], maybePrivateRoots?: string | string[]): string {
-	// The four-argument form is used with a manager's immutable canonical base;
-	// avoid re-realpathing that same directory on every gateway call. The legacy
-	// three-argument form still canonicalizes its cwd-derived base.
-	const base = maybePrivateRoots === undefined ? canonicalWorkspace(cwd) : resolve(baseOrPrivateRoots as string);
+	// Preserve resolver validation in both API forms without treating the base
+	// as an authority boundary. The legacy form still canonicalizes cwd; the
+	// four-argument form validates the supplied canonical base lexically.
+	if (maybePrivateRoots === undefined) canonicalWorkspace(cwd);
+	else resolve(baseOrPrivateRoots as string);
 	const privateRoots = maybePrivateRoots === undefined ? baseOrPrivateRoots : maybePrivateRoots;
 	const result = canonicalCandidate(input, cwd);
-	if (!isInside(result, base)) throw new Error(`PATH_OUTSIDE_BASE: ${input} resolves outside Linden base ${base}`);
+	// File authority is checked by the compiler; cwd/root is only a resolver.
 	for (const privateRoot of Array.isArray(privateRoots) ? privateRoots : [privateRoots]) {
 		if (isInside(result, privateRoot)) throw new Error(`Linden runtime state is not an addressable resource: ${input}`);
 	}
@@ -120,7 +118,7 @@ export interface FileResourceReference {
  * mandatory. A trailing slash is the sole syntactic region marker.
  */
 export function parseFileResourceReference(value: string): FileResourceReference {
-	if (!value.startsWith("file:")) throw new Error(`RESOURCE_ID_REQUIRED: expected file:<address> or web:<selector>/, got ${value}`);
+	if (!value.startsWith("file:")) throw new Error(`RESOURCE_ID_REQUIRED: expected file:<address>, got ${value}`);
 	const address = value.slice("file:".length);
 	if (!address) throw new Error("INVALID_FILE_RESOURCE_ID: file: requires an address");
 	if (address.includes("\\")) throw new Error("INVALID_FILE_RESOURCE_ID: use '/' separators in File resource IDs");

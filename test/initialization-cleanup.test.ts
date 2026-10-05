@@ -39,14 +39,14 @@ test("hosted runtime disposal drops queued turns before and after abort settleme
 	assert.deepEqual(calls, ["clear", "abort", "clear", "dispose"]);
 });
 
-test("Pi coordinator initialization releases its lease when a post-open web grant fails", async () => {
+test("Pi coordinator initialization releases its lease when a workspace restore fails", async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-pi-init-cleanup-"));
 	const stateRoot = join(workspace, ".linden-state");
 	const registry = new SessionRegistry(stateRoot);
 	const piSessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-	const originalGive = SessionAuthorityManager.prototype.give;
-	SessionAuthorityManager.prototype.give = async function () {
-		throw new Error("injected web grant failure");
+	const originalGive = SessionAuthorityManager.prototype.unarchiveWorkspace;
+	SessionAuthorityManager.prototype.unarchiveWorkspace = async function () {
+		throw new Error("injected restore failure");
 	};
 	try {
 		const context: any = {
@@ -60,15 +60,15 @@ test("Pi coordinator initialization releases its lease when a post-open web gran
 		};
 
 		await assert.rejects(
-			PiCoordinator.create({} as any, context, ["example.com"], registry),
-			/injected web grant failure/,
+			PiCoordinator.create({} as any, context, ["net:tcp/public"], registry),
+			/injected restore failure/,
 		);
 
 		const manifest = registry.resolve(`session:${piSessionId}`);
 		const retryLease = registry.acquire(manifest);
 		retryLease.release();
 	} finally {
-		SessionAuthorityManager.prototype.give = originalGive;
+		SessionAuthorityManager.prototype.unarchiveWorkspace = originalGive;
 		rmSync(workspace, { recursive: true, force: true });
 	}
 });
@@ -162,7 +162,7 @@ test("coordinator disposal keeps the lease until an accepted model turn and its 
 		await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
 		assert.equal(closeSettled, false, "runtime disposal alone must not release the lease ahead of the turn callback");
 		const manifest = registry.resolve(`session:${piSessionId}`);
-		assert.throws(() => registry.acquire(manifest), /ACTIVE_BASE_CONFLICT/);
+		assert.throws(() => registry.acquire(manifest), /ACTIVE_WRITE_CONFLICT/);
 
 		rejectTurn(new Error("synthetic shutdown abort"));
 		await Promise.race([
@@ -171,7 +171,7 @@ test("coordinator disposal keeps the lease until an accepted model turn and its 
 		]);
 		assert.equal(statusCalls, 1, "the rejected turn must schedule its authority status callback");
 		assert.equal(closeSettled, false, "dispose must drain the asynchronous authority callback, not only the model Promise");
-		assert.throws(() => registry.acquire(manifest), /ACTIVE_BASE_CONFLICT/);
+		assert.throws(() => registry.acquire(manifest), /ACTIVE_WRITE_CONFLICT/);
 		releaseStatus();
 		await closing;
 		const retryLease = registry.acquire(manifest);
@@ -210,7 +210,7 @@ test("coordinator disposal drains an active Linden tool before releasing its lea
 		await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
 		assert.equal(closeSettled, false);
 		const manifest = registry.resolve(`session:${piSessionId}`);
-		assert.throws(() => registry.acquire(manifest), /ACTIVE_BASE_CONFLICT/);
+		assert.throws(() => registry.acquire(manifest), /ACTIVE_WRITE_CONFLICT/);
 		coordinator.endTool(coordinator.authority.sessionParticipantId);
 		toolActive = false;
 		await closing;
@@ -258,7 +258,7 @@ test("a hosted runtime disposal failure retains the coordinator lease", async ()
 
 		await assert.rejects(coordinator.dispose(), /Pi coordinator did not dispose cleanly/);
 		const manifest = registry.resolve(`session:${piSessionId}`);
-		assert.throws(() => registry.acquire(manifest), /ACTIVE_BASE_CONFLICT/);
+		assert.throws(() => registry.acquire(manifest), /ACTIVE_WRITE_CONFLICT/);
 	} finally {
 		heldLease?.release();
 		rmSync(workspace, { recursive: true, force: true });
@@ -277,7 +277,7 @@ test("standalone host retains its lease when coordinator cleanup fails", async (
 		(activeHost.coordinator as any).dispose = async () => { throw new Error("injected coordinator cleanup failure"); };
 		await assert.rejects(activeHost.dispose(), /Standalone Linden host did not dispose cleanly/);
 		const manifest = activeHost.registry.resolve(activeHost.manifest.id);
-		assert.throws(() => activeHost.registry.acquire(manifest), /ACTIVE_BASE_CONFLICT/);
+		assert.throws(() => activeHost.registry.acquire(manifest), /ACTIVE_WRITE_CONFLICT/);
 	} finally {
 		heldLease?.release();
 		rmSync(workspace, { recursive: true, force: true });

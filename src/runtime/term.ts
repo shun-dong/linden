@@ -1,4 +1,5 @@
-import { spawnSync, type ChildProcess } from "node:child_process";
+import type { NetworkGuard, NetworkBridge } from "./network-bridge.js";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter, once } from "node:events";
 import {
@@ -25,6 +26,7 @@ import {
 } from "./sandbox.js";
 import type { BashPlaceholderJournal } from "./store.js";
 import { pathExpressionContains } from "./paths.js";
+import { requireBubblewrap, requireRuntimeCommand } from "./capabilities.js";
 
 export type TermLifecycle = "running" | "ready" | "stopped";
 type InternalPhase =
@@ -111,6 +113,8 @@ export interface TermEpochEndOutcome {
 
 export interface PersistentTermOptions {
 	id: string;
+	netGuard?: NetworkGuard;
+	onNetworkBridge?: (bridge: NetworkBridge) => void;
 	cwd: string;
 	privateRoots: readonly string[];
 	/**
@@ -242,18 +246,12 @@ interface ProtocolRecord {
 	cwd?: unknown;
 	env?: unknown;
 	message?: unknown;
+	pid?: unknown;
 }
 
 const emptyCleanup = (): PlaceholderCleanupResult => ({ removed: [], violations: [] });
 const isoNow = (): string => new Date().toISOString();
 const delay = (milliseconds: number): Promise<void> => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
-const hasCommand = (command: string): boolean => spawnSync("which", [command], { stdio: "ignore" }).status === 0;
-const commandPath = (command: string, label: string): string => {
-	const result = spawnSync("which", [command], { encoding: "utf8" });
-	const candidate = result.status === 0 ? result.stdout.trim().split(/\r?\n/, 1)[0] : undefined;
-	if (!candidate || !candidate.startsWith("/") || !existsSync(candidate)) throw new Error(`${label} is required for Term`);
-	return realpathSync.native(candidate);
-};
 
 function termSupervisorPath(explicit?: string): string {
 	if (explicit !== undefined && !isAbsolute(explicit)) {
@@ -378,15 +376,6 @@ function existingDirectory(path: string): string | undefined {
 	}
 }
 
-function candidateForInclude(include: string): string | undefined {
-	try {
-		if (existsSync(include) && statSync(include).isDirectory()) return realpathSync.native(include);
-		return existingDirectory(dirname(include));
-	} catch {
-		return existingDirectory(dirname(include));
-	}
-}
-
 function decodeBase64(value: unknown, limit: number): Buffer | undefined {
 	if (typeof value !== "string" || value.length > Math.ceil(limit / 3) * 4 + 4) return undefined;
 	if (value !== "" && !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return undefined;
@@ -419,6 +408,9 @@ export class PersistentTerm extends EventEmitter {
 	private expectedClose = false;
 	private marker = "";
 	private infrastructurePids = new Set<number>();
+	private publicationDirectory?: string;
+	private publicationPids = new Set<number>();
+	private publicationWaiters = new Map<string, { resolve: (pid?: number) => void; reject: (error: Error) => void }>();
 	private backgroundPids = new Set<number>();
 	private current?: ActiveCommand;
 	private commandSequence = 0;
@@ -450,10 +442,10 @@ export class PersistentTerm extends EventEmitter {
 
 	async initialize(): Promise<void> {
 		if (this.phase === "disposed") throw new Error(`Term ${this.id} is disposed`);
-		if (process.platform !== "linux") throw new Error(`Persistent Term requires Linux, got ${process.platform}`);
-		if (!hasCommand("bwrap")) throw new Error("bubblewrap (bwrap) is required for Term");
-		this.scriptPath = commandPath("script", "util-linux script");
+		await requireBubblewrap();
+		this.scriptPath = await requireRuntimeCommand("script", ["--version"]);
 		this.supervisorPath = termSupervisorPath(this.options.supervisorPath);
+		await requireRuntimeCommand(this.supervisorPath, ["--version"]);
 		this.emitState();
 	}
 
@@ -754,14 +746,8 @@ export class PersistentTerm extends EventEmitter {
 		const epochCwd = this.selectEpochCwd(authority);
 		epoch.cwd = epochCwd;
 		this.shellCwd = epochCwd;
-		const cwdIsDirectlyAuthorized = authority.readExpressions.some((expression) => pathExpressionContains(expression, epochCwd));
-		const sandboxAuthority = cwdIsDirectlyAuthorized ? authority : {
-			...authority,
-			// Exact-File authority still needs its otherwise-empty structural parent
-			// as cwd. readPaths remain unchanged, so this does not mount siblings.
-			readExpressions: [...authority.readExpressions, { include: epochCwd, exclude: [] }],
-		};
-		this.sandbox = new DynamicSandbox(epochCwd, sandboxAuthority, [...this.options.privateRoots], this.options.loopbackPorts ?? [], this.supervisorPath, this.options.sharedTmpPath);
+		this.publicationDirectory = mkdtempSync("/tmp/linden-term-expose-");
+		this.sandbox = new DynamicSandbox(epochCwd, authority, [...this.options.privateRoots], this.options.loopbackPorts ?? [], this.supervisorPath, this.options.sharedTmpPath, this.options.netGuard, this.options.onNetworkBridge, this.publicationDirectory);
 		await this.sandbox.initialize();
 		await this.options.onEpochPrepared?.({
 			...startInfo,
@@ -772,21 +758,8 @@ export class PersistentTerm extends EventEmitter {
 		this.emitState();
 	}
 
-	private selectEpochCwd(authority: EffectiveAuthority): string {
-		for (const preferred of [this.shellCwd, this.options.cwd]) {
-			const directory = existingDirectory(preferred);
-			if (directory && authority.readExpressions.some((expression) => pathExpressionContains(expression, directory))) return directory;
-		}
-		for (const expression of authority.readExpressions) {
-			if (!pathExpressionContains(expression, expression.include)) continue;
-			const candidate = candidateForInclude(expression.include);
-			if (candidate) return candidate;
-		}
-		for (const readablePath of authority.readPaths) {
-			const candidate = candidateForInclude(readablePath);
-			if (candidate) return candidate;
-		}
-		throw new Error(`Term ${this.id} has no authorized readable directory usable as cwd`);
+	private selectEpochCwd(_authority: EffectiveAuthority): string {
+		return this.shellCwd ?? this.options.cwd;
 	}
 
 	private async startSupervisor(cwd: string): Promise<void> {
@@ -846,6 +819,21 @@ export class PersistentTerm extends EventEmitter {
 		}
 		if (record.marker !== this.marker) {
 			this.queueRuntimeFailure(new Error("Term supervisor control marker mismatch"));
+			return;
+		}
+		if (record.type === "published" || record.type === "unpublished") {
+			const waiter = this.publicationWaiters.get(String(record.id));
+			if (!waiter) { this.queueRuntimeFailure(new Error("Unexpected publication acknowledgement")); return; }
+			if (record.type === "published" && typeof record.pid === "number" && this.child?.pid) {
+				for (const pid of descendantRecords(this.child.pid).keys()) {
+					try {
+						const localPid = readFileSync(`/proc/${pid}/status`, "utf8").match(/^NSpid:\s+(.+)$/m)?.[1].trim().split(/\s+/).at(-1);
+						if (Number(localPid) === record.pid) { this.publicationPids.add(pid); break; }
+					} catch { /* epoch may be ending */ }
+				}
+			}
+			this.publicationWaiters.delete(String(record.id));
+			waiter.resolve(typeof record.pid === "number" ? record.pid : undefined);
 			return;
 		}
 		if (record.type === "ready") {
@@ -974,7 +962,12 @@ export class PersistentTerm extends EventEmitter {
 		const records = descendantRecords(root);
 		const workload = new Set<number>();
 		for (const [pid, record] of records) {
-			if (!this.infrastructurePids.has(pid) && record.state !== "Z") workload.add(pid);
+			if (!this.infrastructurePids.has(pid) && record.state !== "Z") {
+				let parent = record.ppid;
+				const seen = new Set<number>();
+				while (parent && !seen.has(parent) && !this.publicationPids.has(parent)) { seen.add(parent); parent = records.get(parent)?.ppid ?? 0; }
+				if (!this.publicationPids.has(parent) && !this.publicationPids.has(pid)) workload.add(pid);
+			}
 		}
 		return workload;
 	}
@@ -1092,6 +1085,30 @@ export class PersistentTerm extends EventEmitter {
 		this.emitState();
 	}
 
+	async publishPort(id: string, port: number): Promise<string> {
+		if (!this.epoch || !this.publicationDirectory || !this.controlSocket) throw new Error("NET_SERVICE_UNAVAILABLE: Term has no live epoch");
+		if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid internal TCP port");
+		const socketPath = join(this.publicationDirectory, `${randomUUID()}.sock`);
+		await this.publicationCommand(id, { type: "publish", id, port, socket: socketPath });
+		return socketPath;
+	}
+
+	async unpublishPort(id: string): Promise<void> {
+		if (!this.controlSocket) return;
+		await this.publicationCommand(id, { type: "unpublish", id });
+	}
+
+	private async publicationCommand(id: string, record: Record<string, unknown>): Promise<void> {
+		let timeout: NodeJS.Timeout | undefined;
+		try {
+			await new Promise<void>((resolvePromise, reject) => {
+				this.publicationWaiters.set(id, { resolve: () => resolvePromise(), reject });
+				timeout = setTimeout(() => reject(new Error("Publication supervisor acknowledgement timed out")), 5000);
+				try { this.writeProtocol({ ...record, marker: this.marker }); } catch (error) { reject(error as Error); }
+			});
+		} finally { clearTimeout(timeout); this.publicationWaiters.delete(id); }
+	}
+
 	private async closeSandbox(): Promise<void> {
 		const child = this.child;
 		this.expectedClose = true;
@@ -1108,6 +1125,11 @@ export class PersistentTerm extends EventEmitter {
 		this.child = undefined;
 		this.childClose = undefined;
 		this.infrastructurePids.clear();
+		this.publicationPids.clear();
+		for (const waiter of this.publicationWaiters.values()) waiter.reject(new Error("Term epoch ended"));
+		this.publicationWaiters.clear();
+		if (this.publicationDirectory) rmSync(this.publicationDirectory, { recursive: true, force: true });
+		this.publicationDirectory = undefined;
 		this.controlBuffer = "";
 		try { await this.closeControlServer(); }
 		catch (error) { failure = error as Error; }

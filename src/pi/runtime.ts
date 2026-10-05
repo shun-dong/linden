@@ -1,5 +1,7 @@
+import { canReadPath, canWritePath } from "../compiler/judgment.js";
+import { authoritySummary, managedParticipants } from "../runtime/authority-display.js";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import {
@@ -13,13 +15,15 @@ import {
 	type SessionEntry,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { SessionAuthorityManager, type CheckpointEnvelope } from "../runtime/manager.js";
+import { SessionAuthorityManager, type AuthorityTransferReceipt, type CheckpointEnvelope } from "../runtime/manager.js";
 import { formatMaxAgentDepth, normalizeMaxAgentDepth } from "../runtime/agent-depth.js";
 import type { AgentStateNode, MessageKind, MessageRecord, ParticipantId, ResourceId, VersionId } from "../runtime/model.js";
+import { netReference } from "../runtime/net.js";
 import { canonicalBase, fileResourceId, isInside, resolveFileResourceReference, type PathExpression } from "../runtime/paths.js";
 import { SessionLease, SessionRegistry } from "../runtime/sessions.js";
 import { stateDirectory } from "../runtime/store.js";
 import { formatParticipants } from "./participants.js";
+import { sequentialTransfers, type BatchTransferResult, type GiveResult, type GetPermissionResult } from "./transfers.js";
 import {
 	PersistentTerm,
 	type TermEpochEndInfo,
@@ -40,28 +44,27 @@ export const PAYLOAD_ENTRY = "linden-mail-payload";
 export const CHECKPOINT_ENTRY = "linden-typed-checkpoint";
 export const RUNTIME_NOTICE = "linden-runtime-notice";
 export const MAIL_BATCH = "linden-mail-batch";
-const RESTORE_NOTICE_TEXT = "[Linden restore] This session was restored because the previous Linden process exited. Your authority and mailbox are unchanged; continue from the current ledger state.";
 
 export const RUNTIME_GUIDANCE = [
 	"Linden collaboration semantics:",
-	"- Human, Agent, and Term are participants in one typed tree. spawn creates an Agent or Term direct child; kind defaults to Agent. It snapshots the parent's effective File reads by default (human top-level spawn is limited to the current cwd region); explicit grants require typed file:<address> or web:<selector>/ references, use & for a read grant, and inheritRead=false opts out.",
-	"- maxAgentDepth counts only Agent participants along a lineage. Term participants do not consume Agent depth, and spawning a Term remains available when the current Agent is already at the Agent-depth limit.",
-	"- running means the participant's own foreground is active; ready means its foreground is inactive but its subtree or background work may remain; stopped is the fully quiescent ready substate.",
-	"- listen observes kind-specific published output without consuming mail. wait blocks for ready or stopped, but an ordinary message arriving for the waiting participant wakes it so the message can be received; the message remains pending and grants no authority. interrupt affects only the target's own foreground; stop recursively stops the target, descendants, and background work.",
-	"- A Term is a persistent sandboxed terminal participant. exec starts one raw command only while it is ready; input writes raw bytes only while it is running. Its cwd and exported environment persist safely between exec epochs, while completion and background-process state are determined by the runtime supervisor. listen shows live lifecycle and bounded in-memory output; log shows durable completed/recovered epoch and command traces without starting a sandbox.",
-	"- send carries only ordinary information between Human/Agent participants and grants no authority. Ready Agent targets receive pending follow-ups in FIFO batches; Human targets retain unread mail for their control plane. receive checks and FIFO-consumes every currently pending mailbox message, optionally filtered by an ordinary participant pointer.",
-	"- The initial participant tree and participants tool acquire ordinary read-only participant pointers to the displayed live nodes. Send directly to discovered Human/Agent peers, including siblings and other branches; no parent relay is needed. On an unknown-target or missing-pointer send error, call participants to refresh IDs and pointers before retrying. Discovery grants no File/Web permissions or lifecycle control.",
-	"- A completed Agent final is automatically recorded as an ordinary follow-up to its direct parent; use send for additional or earlier information. steer is the Agent-specific ancestor-to-descendant control and grants no authority.",
-	"- File-region refinement is automatic for typed resource references used by give, get, and spawn; there are no public subpath/file tools. Absolute, '~', '.', './', and relative addresses canonicalize immediately and must remain inside the immutable session base. read returns State_File = Absent | Present(String); stat observes the same state without content.",
-	"- Participants have no Web authority by default. Web grants use web:<exact-host>/ or web:*.example.com/ and never URL paths.",
-	"- Direct-child and transitive-descendant roles permit common observation/wait/control. They also permit log on descendant Agent/Term participants; an Agent may log itself. They do not grant receive, rewind, give, or get, and ordinary IDs/pointers do not grant parent or sibling log access.",
-	"- give transfers authority across a direct edge and completes atomically and silently. A plain typed resource reference moves complete ownership to the peer immediately; a leading & grants a read pointer. File references require file: even when the address is relative; a trailing / is the sole File-region marker.",
-	"- get takes back a resource currently owned by your own direct child, atomically and without any prior give. Ownership transfer stays edge-scoped, so a deeper recovery propagates one direct edge at a time; a child cannot take from its parent. If an Agent owner is mid-turn, its current tool finishes, later tools are held until ownership moves, and a Linden runtime notice then updates the Agent so it continues its existing loop with the new authority. get does not interrupt or stop that Agent; descendants remain unaffected.",
-	"- For an Agent, listen reports the raw Pi leaf and nearest typed checkpoint; log shows its durable Pi tree and marks rewindable typed Agent state IDs. For a Term, log shows durable epoch/command times, exit codes, and bounded output ranges. rewind changes Agent context only and does not automatically start a model turn. If the Agent is running, its current tool finishes, later tools and mailbox activation are held, then the old loop is stopped before navigation and the reconciliation notice.",
-	"- participants lists every live Human, Agent, and Term with its lifecycle. IDs are discoverable Strings, never capabilities.",
-	"- archive is destructive: it requires a stopped direct-child subtree, reclaims its external authority, removes it from the live participant tree, and has no unarchive path.",
-	"- Participant targets accept a full participant ID; Agent targets also accept a unique Pi-session suffix. Pi UUID prefixes often coincide, so prefer a distinctive suffix.",
-	"- Participant/resource/state IDs are Strings, not capabilities. Possession of an ID never bypasses pointer, ownership, kind, lifecycle, or hierarchy checks.",
+	"- Human, Agent, and Term share one workspace authority ledger and typed participant tree. Each Agent has its own Pi session. IDs and resource names are strings, not capabilities.",
+	"- spawn creates a direct Agent or Term child. Its root defaults to your root (Human uses CLI cwd), rootDir overrides it, and it inherits your effective File reads unless inheritRead=false. Explicit grants use typed file: or net: references; & gives a use projection, plain gives complete ownership. Net is never automatically inherited.",
+	"- root directories are positions, not permission boundaries. File authority may cover multiple external roots. Agent Bash defaults to its own root; a Term preserves cwd and exported environment. Unreadable cwd is an empty sandbox skeleton with no implicit host access.",
+	"- maxAgentDepth counts only Agent edges below Human. Term participants do not consume Agent depth; Term creation remains available at the Agent depth limit.",
+	"- running means own foreground active; ready means own foreground inactive but background/descendants may remain; stopped is the fully quiescent ready substate.",
+	"- listen, wait, interrupt, and stop target strict descendants of any kind. listen observes without consuming mail; wait observes ready/stopped. interrupt affects one foreground; stop quiesces a subtree and its background work. log accepts your own Agent or a strict descendant Agent/Term.",
+	"- exec starts a command in a ready/stopped descendant Term. input targets a running descendant Term's stdin. listen returns bounded live output; log shows durable completed/recovered epoch traces without starting a process.",
+	"- participants and birth snapshots introduce ordinary read-only participant pointers. send can reach discovered Human/Agent peers across branches; strings carry information only. Refresh participants after a missing-pointer or unknown-target error.",
+	"- receive explicitly FIFO-consumes pending mail, optionally filtered by an ordinary sender pointer. Agent finals become follow-ups to their direct parent; Human retains unread mail.",
+	"- runtime messages, follow-ups, and steering all interrupt wait. Runtime notices add context without waking a stopped Agent or blocking tools. Follow-ups and steering can wake stopped live Agents; steering also holds tools that have not begun. Started tools finish.",
+	"- typed File refinement is automatic in give/get/spawn; there are no public file/subpath tools. Trailing / denotes a File region. Native Pi read keeps text/image behavior and missing-file errors; stat and the underlying typed read represent Absent/Present.",
+	"- Net is exact TCP IP/DNS+port or the predefined public endpoint set. Complete Net can connect, publish/unpublish, refine, and transfer. &Net can only connect and cannot be forwarded, inherited, refined or used to manage services. TCP is bidirectional. DNS/IP identities differ and each DNS connection is checked and audited; public/DNS grants reject private targets, explicit private IP is supported.",
+	"- give operates only over a direct parent-child edge and records runtime permission notices atomically. get from your direct child reclaims complete ownership. get from your direct parent only requests: manual approval requires parent give, or parent permission all-of-mine automatically grants only its currently legal rights. No sibling reclaim or upward auto-request occurs.",
+	"- An Agent's active tool finishes before child authority is reclaimed; later tools wait until commit, then its loop proceeds naturally. An open Term epoch is never stopped implicitly for transfer: explicitly stop it first if authority must move.",
+	"- publish requires your complete exact Net and control of a live descendant Term. It bridges the internal TCP port through a workspace Unix socket broker, not an arbitrary host bind. Unpublish closes the bridge/connections while leaving the service alive; published Net cannot move until unpublished.",
+	"- archive retains a stopped direct-child subtree while reclaiming its rights. unarchive atomically restores all original permissions or fails and leaves participants stopped. Unchanged File restoration adds no notice; changed Files and all restored Net need notices. Old unread tasks remain explicitly receivable and do not automatically replay.",
+	"- fork copies one live/retained direct-child Agent branch into a fresh Agent with no resource rights, children, policy, processes, old typed checkpoints or pending work; a fork notice explains current authority.",
+	"- branch creates and switches to a named history branch of a direct-child Agent (state omitted means current context); switch selects an existing branch; rewind moves the current branch to a typed Pi checkpoint. New checkpoints and navigation notices advance only the current branch. History navigation does not undo File/network/message/process effects, and records a context notice without starting a model turn. Participant targets accept full IDs; live Agent targets also accept a unique Pi-session suffix.",
 ].join("\n");
 
 export const COMPACT_FIXED_TEAM_RUNTIME_GUIDANCE = [
@@ -69,9 +72,9 @@ export const COMPACT_FIXED_TEAM_RUNTIME_GUIDANCE = [
 	"- The model-Agent roster is fixed. The birth snapshot already grants read-only pointers to every listed participant, so send directly to listed Human/Agent peers; call participants only after a missing-pointer error or after creating a Term.",
 	"- Additional Agent spawning is disabled. Term spawning remains available: a Term is a persistent sandboxed terminal participant whose exec/input/listen/log operations preserve cwd and exported environment between command epochs.",
 	"- send carries information only and grants no authority; receive FIFO-consumes pending mail. A completed Agent final is also published to its parent.",
-	"- File authority is separate from participant pointers. read/stat require readable authority. give/get/spawn accept typed file:<address> references; Linden automatically refines directory authority for exact child paths. A plain reference moves ownership and & grants a read pointer. Ownership transfers only across a direct tree edge.",
+	"- File authority is separate from participant pointers. read/stat require readable authority. give/get/spawn accept typed file:<address> and net:tcp/... references; Linden automatically refines directory authority for exact child paths. A plain reference moves ownership and & grants a use projection (File read, Net connect). Ownership transfers only across a direct tree edge.",
 	"- Use only Linden gateways for files, Bash, messages, transfers, checkout, and participants. IDs are strings, not capabilities, and never bypass ownership, pointers, kind, lifecycle, or hierarchy checks.",
-	"- wait observes ready/stopped states; ordinary mail can wake a waiting Agent. interrupt affects one foreground, while stop recursively stops a subtree. archive permanently removes a stopped direct-child subtree.",
+	"- wait observes ready/stopped states; ordinary mail can wake a waiting Agent. interrupt affects one foreground, while stop recursively stops a subtree. archive retains a stopped direct-child subtree for atomic unarchive or history-only fork.",
 ].join("\n");
 
 export type RuntimeGuidanceProfile = "full" | "compact-fixed-team";
@@ -83,10 +86,7 @@ export function needsParticipantTreeBirthSnapshot(entries: readonly SessionEntry
 export function runtimeGuidanceForParticipant(agentSpawnEnabled: boolean, profile: RuntimeGuidanceProfile = "full"): string {
 	if (profile === "compact-fixed-team") return COMPACT_FIXED_TEAM_RUNTIME_GUIDANCE;
 	if (agentSpawnEnabled) return RUNTIME_GUIDANCE;
-	return RUNTIME_GUIDANCE.replace(
-		"- Human, Agent, and Term are participants in one typed tree. spawn creates an Agent or Term direct child; kind defaults to Agent. It snapshots the parent's effective File reads by default (human top-level spawn is limited to the current cwd region); explicit grants require typed file:<address> or web:<selector>/ references, use & for a read grant, and inheritRead=false opts out.",
-		"- Human, Agent, and Term are participants in one typed tree. For this participant, Agent child spawning is disabled and spawn creates only a Term direct child. It snapshots the parent's effective File reads by default; explicit grants require typed file:<address> or web:<selector>/ references, use & for a read grant, and inheritRead=false opts out.",
-	);
+	return `${RUNTIME_GUIDANCE}\n- For this participant, additional Agent spawning is disabled; spawn accepts only Term.`;
 }
 
 export interface MailPayload {
@@ -109,7 +109,8 @@ export interface MailBatch {
 
 export interface RuntimeNoticeOptions {
 	continueLoop?: boolean;
-	kind?: "rewind" | "authority-change";
+	kind?: "rewind" | "authority-change" | "restore" | "fork";
+	eventId?: string;
 }
 
 export interface ParticipantRuntime {
@@ -249,7 +250,7 @@ export class RootParticipantRuntime implements ParticipantRuntime {
 	suspendMailboxWake(): void { this.wakeAgent = false; }
 
 	async appendRuntimeNotice(text: string, options: RuntimeNoticeOptions = {}): Promise<string> {
-		const message = { customType: RUNTIME_NOTICE, content: text, display: true, details: { kind: options.kind ?? "rewind" } };
+		const message = { customType: RUNTIME_NOTICE, content: text, display: true, details: { kind: options.kind ?? "rewind", eventId: options.eventId } };
 		if (!options.continueLoop) this.pi.sendMessage(message, { triggerTurn: false });
 		else if (this.context.isIdle()) this.pi.sendMessage(message, { triggerTurn: true });
 		else this.pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
@@ -327,12 +328,20 @@ export class ChildParticipantRuntime implements ParticipantRuntime {
 
 	async navigate(entryId: string): Promise<void> {
 		if (this.session.isStreaming) throw new Error(`PI_NAVIGATION_WHILE_RUNNING: ${this.participantId} must be quiescent before context navigation`);
+		const manager = this.session.sessionManager;
+		const entry = manager.getEntry(entryId);
+		if (entry?.type === "custom_message" || (entry?.type === "message" && entry.message.role === "user")) {
+			const oldLeaf = manager.getLeafId();
+			manager.branch(entryId);
+			entryId = manager.appendCustomEntry("linden:context-anchor", {});
+			if (oldLeaf) manager.branch(oldLeaf);
+		}
 		const result = await this.session.navigateTree(entryId, { summarize: false });
 		if (result.cancelled) throw new Error(`Pi cancelled navigation to ${entryId}`);
 	}
 
 	async appendRuntimeNotice(text: string, options: RuntimeNoticeOptions = {}): Promise<string> {
-		const message = { customType: RUNTIME_NOTICE, content: text, display: true, details: { kind: options.kind ?? "rewind" } };
+		const message = { customType: RUNTIME_NOTICE, content: text, display: true, details: { kind: options.kind ?? "rewind", eventId: options.eventId } };
 		if (!options.continueLoop) {
 			await this.session.sendCustomMessage(message, { triggerTurn: false });
 		} else {
@@ -398,6 +407,7 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 	private readonly steeringBlocks = new Map<ParticipantId, Set<string>>();
 	private readonly restoredSessionFiles = new Map<string, ParticipantId>();
 	private readonly participantRestores = new Map<ParticipantId, Promise<ParticipantId>>();
+	private runtimeEventFlush?: Promise<void>;
 	private readonly termRuntimeCreates = new Map<ParticipantId, Promise<TermParticipantRuntime>>();
 	private topologyTail: Promise<void> = Promise.resolve();
 	private readonly activeTools = new Map<ParticipantId, number>();
@@ -434,13 +444,13 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 
 	private constructor(readonly pi: ExtensionAPI | undefined, readonly authority: SessionAuthorityManager, private context?: ExtensionContext) {}
 
-	static async create(pi: ExtensionAPI, context: ExtensionContext, webDomains: string[], registry = new SessionRegistry(), maxAgentDepthInput?: number): Promise<PiCoordinator> {
+	static async create(pi: ExtensionAPI, context: ExtensionContext, permissionInputs: string[], registry = new SessionRegistry(), maxAgentDepthInput?: number): Promise<PiCoordinator> {
 		const piSessionId = context.sessionManager.getSessionId();
 		const lindenSessionId = `session:${piSessionId}`;
 		const requestedMaxAgentDepth = normalizeMaxAgentDepth(maxAgentDepthInput);
 		let manifest;
 		try { manifest = registry.resolve(lindenSessionId); }
-		catch { manifest = registry.create(context.cwd, lindenSessionId, { maxAgentDepth: requestedMaxAgentDepth }); }
+		catch { manifest = registry.create(context.cwd, lindenSessionId, { maxAgentDepth: requestedMaxAgentDepth, permissions: permissionInputs }); }
 		if (requestedMaxAgentDepth !== undefined && manifest.maxAgentDepth !== requestedMaxAgentDepth) {
 			throw new Error(`Linden session maxAgentDepth is ${manifest.maxAgentDepth ?? "unlimited"}, not ${requestedMaxAgentDepth}`);
 		}
@@ -449,11 +459,8 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 		let coordinator: PiCoordinator | undefined;
 		try {
 			manifest = registry.touch(manifest);
-			const authority = await SessionAuthorityManager.open({ base: manifest.base, lindenSessionId, sessionId: piSessionId, sessionName: context.sessionManager.getSessionName(), sessionFile: context.sessionManager.getSessionFile(), webDomains, maxAgentDepth: manifest.maxAgentDepth, stateRoot: registry.root, stateDir: stateDirectory(lindenSessionId, registry.root) });
-			for (const selector of webDomains) {
-				const resourceId = authority.materializeWeb(authority.rootParticipantId, `web:${selector}/`);
-				if (authority.resource(resourceId)?.ownerId === authority.rootParticipantId) await authority.give(authority.rootParticipantId, authority.sessionParticipantId, resourceId, "move");
-			}
+			const authority = await SessionAuthorityManager.open({ base: manifest.base, lindenSessionId, sessionId: piSessionId, sessionName: context.sessionManager.getSessionName(), sessionFile: context.sessionManager.getSessionFile(), permissions: manifest.permissions, maxAgentDepth: manifest.maxAgentDepth, stateRoot: registry.root, stateDir: stateDirectory(lindenSessionId, registry.root) });
+			await authority.unarchiveWorkspace();
 			coordinator = new PiCoordinator(pi, authority, context);
 			coordinator.sessionLease = lease;
 			coordinator.root = new RootParticipantRuntime(authority.sessionParticipantId, pi, context, true);
@@ -461,7 +468,6 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 			coordinator.runtimes.set(authority.rootParticipantId, coordinator.humanRoot);
 			coordinator.runtimes.set(authority.sessionParticipantId, coordinator.root);
 			coordinator.humanMessageHandler = (_message, payload) => context.ui.notify(`[Linden unread] ${summarizeMessage(payload)}`, "info");
-			if (authority.wasParticipantRunningAtOpen(authority.sessionParticipantId)) await coordinator.root.appendRuntimeNotice(RESTORE_NOTICE_TEXT);
 			return coordinator;
 		} catch (error) {
 			try {
@@ -486,6 +492,7 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 	setHumanMessageHandler(handler: HumanMessageHandler): void { this.humanMessageHandler = handler; }
 	setHumanFinalConsumer(consumer: HumanFinalConsumer | undefined): void { this.humanFinalConsumer = consumer; }
 	setTermLoopbackPorts(ports: readonly number[]): void {
+		if (ports.length && this.authority.snapshot().explicitAuthority) throw new Error("Use an exact Net grant and publish; implicit host loopback ports are unsupported");
 		if (new Set(ports).size !== ports.length || ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535)) throw new Error("Term loopback ports must be unique integers in 1..65535");
 		this.termLoopbackPorts = [...ports];
 	}
@@ -591,28 +598,23 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 	private async attachRestoredSession(participantId: ParticipantId, sessionFile: string): Promise<void> {
 		if (!this.toolFactory) throw new Error("Pi tool factory is not configured");
 		const { manager, canonicalFile } = this.openPersistedSessionManager(participantId, sessionFile);
+		const branches = this.authority.agentBranches(participantId);
+		const head = branches.heads[branches.current];
+		const nearest = this.nearestAgentState(participantId, manager.getLeafId() ?? undefined, manager.getEntries());
+		const recoverNavigation = head !== undefined && nearest?.id !== head;
+		if (recoverNavigation) manager.branch(this.authority.requireRewind(this.authority.participant(participantId)!.parentId!, participantId, head).piEntryId);
 		const existingParticipant = this.restoredSessionFiles.get(canonicalFile);
 		if (existingParticipant && existingParticipant !== participantId) throw new Error(`Persisted Pi session ${canonicalFile} is already bound to ${existingParticipant}`);
 		this.restoredSessionFiles.set(canonicalFile, participantId);
 		let runtime: ChildParticipantRuntime | undefined;
 		try {
-			if (this.hostedRuntimeFactory) {
-				const runtimeHost = await this.hostedRuntimeFactory(participantId, manager);
-				runtime = new HostedParticipantRuntime(participantId, runtimeHost);
-			} else {
-				const context = this.context;
-				if (!context) throw new Error("No Pi extension context or standalone runtime factory is configured");
-				const created = await createAgentSession({ cwd: manager.getCwd(), model: context.model, thinkingLevel: context.thinkingLevel, scopedModels: [...context.scopedModels], sessionManager: manager, customTools: this.toolFactory(this, participantId, manager.getCwd()), noTools: "all", tools: toolNames() });
-				runtime = new ChildParticipantRuntime(participantId, created.session);
-			}
+			runtime = await this.createAgentRuntime(participantId, manager);
 			this.subscribeRuntime(runtime);
-			const published = await this.publishPreparedRuntime(participantId, runtime, "agent", true);
-			// Only a stale running state proves that the previous process exited in
-			// the middle of a turn. Cleanly idle sessions need no persistent notice.
-			// If shutdown won the race, the final disposal wave owns this runtime and
-			// no new persistent session work may start.
-			if (published === runtime && !this.disposed && this.authority.wasParticipantRunningAtOpen(participantId) && runtime.appendRuntimeNotice) {
-				await runtime.appendRuntimeNotice(RESTORE_NOTICE_TEXT);
+			await this.publishPreparedRuntime(participantId, runtime, "agent", true);
+			if (recoverNavigation) {
+				const effect = this.authority.snapshot().effects.filter((item) => item.kind === "rewind" && item.targetId === participantId && item.stateId === head).at(-1);
+				if (effect) await this.appendRewindNoticeAfterCommit(participantId, head, manager.getLeafId()!, effect.sequence);
+				else await this.appendCheckpoint(participantId, "history-restore");
 			}
 		} catch (error) {
 			if (runtime && this.runtimes.get(participantId) === runtime) this.runtimes.delete(participantId);
@@ -620,6 +622,26 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 			try { if (runtime) await this.disposeRuntimeOnce(runtime); } catch { /* preserve restore failure */ }
 			throw error;
 		}
+	}
+
+	/** Creation only: callers retain the adapter before subscribing and own rollback/publication. */
+	private async createAgentRuntime(participantId: ParticipantId, sessionManager: SessionManager): Promise<ChildParticipantRuntime> {
+		if (this.hostedRuntimeFactory) {
+			return new HostedParticipantRuntime(participantId, await this.hostedRuntimeFactory(participantId, sessionManager));
+		}
+		const context = this.context;
+		if (!context) throw new Error("No Pi extension context or standalone runtime factory is configured");
+		const created = await createAgentSession({
+			cwd: sessionManager.getCwd(),
+			model: context.model,
+			thinkingLevel: context.thinkingLevel,
+			scopedModels: [...context.scopedModels],
+			sessionManager,
+			customTools: this.toolFactory!(this, participantId, sessionManager.getCwd()),
+			noTools: "all",
+			tools: toolNames(),
+		});
+		return new ChildParticipantRuntime(participantId, created.session);
 	}
 
 	private openPersistedSessionManager(participantId: ParticipantId, sessionFile: string): { manager: SessionManager; canonicalFile: string } {
@@ -750,12 +772,13 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 		const name = options.name?.trim() || childId.slice(-8);
 		let runtime: TermParticipantRuntime | undefined;
 		await this.authority.spawnWith(participantId, childId, name, grants, async () => {
-			runtime = await this.createTermRuntime(childId, name, options.cwd ?? this.authority.base);
+			runtime = await this.createTermRuntime(childId, name, options.cwd ?? this.authority.participantRoot(participantId));
 			return {};
 		}, {
 			participantKind: "term",
 			inheritWorkspaceRead: options.inheritRead ?? true,
 			defaultReadRoot: options.cwd,
+			rootDir: options.cwd ?? this.authority.participantRoot(participantId),
 		});
 		if (!runtime) throw new Error(`Term runtime ${childId} was not created`);
 		await this.publishPreparedRuntime(childId, runtime, "term", false);
@@ -767,6 +790,8 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 		const term = new PersistentTerm({
 			id: participantId,
 			cwd,
+			netGuard: this.authority.networkGuard(participantId),
+			onNetworkBridge: (bridge) => this.authority.registerNetworkBridge(participantId, bridge),
 			privateRoots: this.authority.privateRoots,
 			loopbackPorts: this.termLoopbackPorts,
 			sharedTmpPath: this.authority.sandboxTmpPath,
@@ -777,6 +802,7 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 			}),
 			onEpochPrepared: (info: TermEpochPreparedInfo) => this.authority.prepareTermEpoch(participantId, info.epochId, info.placeholders),
 			onEpochEnd: async (info: TermEpochEndInfo): Promise<TermEpochEndOutcome> => {
+				this.authority.forgetTermPublications(participantId);
 				try {
 					await this.authority.finishTermEpoch({
 						termId: participantId,
@@ -850,7 +876,7 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 		return runtime;
 	}
 
-	private async spawnNow(participantId: ParticipantId, name: string | undefined, prompt: string | undefined, grantInputs: readonly string[], inheritRead: boolean, humanCwd?: string, childAgentSpawnEnabled = true): Promise<ParticipantId> {
+	private async spawnNow(participantId: ParticipantId, name: string | undefined, prompt: string | undefined, grantInputs: readonly string[], inheritRead: boolean, humanCwd?: string, childAgentSpawnEnabled = true, preparedSession?: SessionManager): Promise<ParticipantId> {
 		if (!this.toolFactory) throw new Error("Pi tool factory is not configured");
 		const grants: Array<{ resourceId: ResourceId; mode: "move" | "read" }> = [];
 		for (const input of grantInputs) {
@@ -859,8 +885,8 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 		}
 		const directory = join(this.authority.stateDir, "pi-sessions");
 		const parentSession = this.runtime(participantId).sessionFile;
-		const cwd = humanCwd ?? this.runtimes.get(participantId)?.cwd ?? this.authority.workspace;
-		const sessionManager = this.createPersistedSessionManager(directory, parentSession, cwd);
+		const cwd = humanCwd ?? this.authority.participantRoot(participantId);
+		const sessionManager = preparedSession ?? this.createPersistedSessionManager(directory, parentSession, cwd);
 		const childId = `agent:${sessionManager.getSessionId()}`;
 		if (!childAgentSpawnEnabled) this.agentSpawnDisabled.add(childId);
 		const sessionName = name?.trim() || childId.slice(-8);
@@ -868,31 +894,13 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 		let childRuntime: ChildParticipantRuntime | undefined;
 		try {
 			await this.authority.spawnWith(participantId, childId, sessionName, grants, async () => {
-				if (this.hostedRuntimeFactory) {
-					const runtimeHost = await this.hostedRuntimeFactory(childId, sessionManager);
-					// Registration is deliberately delayed until the authority commit is
-					// durable. A final binding or persistence failure must not leave a
-					// runnable child that does not exist in the ledger.
-					childRuntime = new HostedParticipantRuntime(childId, runtimeHost);
-					this.subscribeRuntime(childRuntime);
-					return { piSessionId: runtimeHost.session.sessionId, sessionFile: runtimeHost.session.sessionFile };
-				}
-				const context = this.context;
-				if (!context) throw new Error("No Pi extension context or standalone runtime factory is configured");
-				const created = await createAgentSession({
-					cwd: sessionManager.getCwd(),
-					model: context.model,
-					thinkingLevel: context.thinkingLevel,
-					scopedModels: [...context.scopedModels],
-					sessionManager,
-					customTools: this.toolFactory!(this, childId, sessionManager.getCwd()),
-					noTools: "all",
-					tools: toolNames(),
-				});
-				childRuntime = new ChildParticipantRuntime(childId, created.session);
+				childRuntime = await this.createAgentRuntime(childId, sessionManager);
+				// Registration is deliberately delayed until the authority commit is
+				// durable. A final binding or persistence failure must not leave a
+				// runnable child that does not exist in the ledger.
 				this.subscribeRuntime(childRuntime);
-				return { piSessionId: created.session.sessionId, sessionFile: created.session.sessionFile };
-			}, { inheritWorkspaceRead: inheritRead, defaultReadRoot: humanCwd });
+				return { piSessionId: childRuntime.piSessionId, sessionFile: childRuntime.sessionFile };
+			}, { inheritWorkspaceRead: inheritRead, defaultReadRoot: humanCwd, rootDir: cwd });
 		} catch (error) {
 			// createRuntime may have acquired model, extension, or filesystem
 			// services before authority's final validation. Dispose them before
@@ -996,20 +1004,85 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 	/**
 	 * give transfers authority across a direct edge and completes atomically:
 	 * a plain resource argument moves complete ownership to the peer
-	 * immediately, a leading & grants a read pointer. No notification is sent;
-	 * passive holding is normal and participants discover authority through
-	 * the authority tool. File resource arguments require the file: kind even
+	 * immediately, a leading & grants a use pointer. Runtime notices describe
+	 * authority changes and any external File changes saved during ownership
+	 * transfer. File resource arguments require the file: kind even
 	 * when their address is relative, then auto-refine against the giver's
 	 * covering File region.
 	 */
-	async give(participantId: ParticipantId, reference: string, resourceInput: string, cwd?: string): Promise<{ targetId: ParticipantId; mode: "move" | "read"; moved: ResourceId[] }> {
+	async give(participantId: ParticipantId, reference: string, resourceInput: string, cwd?: string): Promise<GiveResult> {
 		const targetId = this.resolveParticipantRef(reference);
 		// An invalid peer must fail before typed File auto-refinement can persist.
 		this.authority.requireGiveParticipant(participantId, targetId);
 		const mode = resourceInput.startsWith("&") ? "read" : "move";
 		const resourceId = await this.resolveGrantResource(participantId, mode === "read" ? resourceInput.slice(1) : resourceInput, mode, cwd);
-		const moved = await this.authority.give(participantId, targetId, resourceId, mode);
-		return { targetId, mode, moved };
+		const receipt = await this.authority.giveWithReceipt(participantId, targetId, resourceId, mode);
+		await this.flushRuntimeEvents();
+		return { targetId, mode, moved: receipt.resources, fileUpdates: receipt.fileUpdates };
+	}
+
+	async transferResources(participantId: ParticipantId, reference: string, resources: readonly string[], kind: "give" | "get", cwd?: string): Promise<BatchTransferResult> {
+		return sequentialTransfers(resources, (resource) => kind === "give"
+			? this.give(participantId, reference, resource, cwd)
+			: this.getPermission(participantId, reference, resource, cwd));
+	}
+
+	/** Parent-directed get is a request. Only the parent can perform its give. */
+	async getPermission(participantId: string, reference: string, input: string, cwd?: string): Promise<GetPermissionResult> {
+		const targetId = this.resolveParticipantRef(reference);
+		const caller = this.authority.participant(participantId);
+		if (caller?.parentId === targetId) {
+			const read = input.startsWith("&");
+			const typed = read ? input.slice(1) : input;
+			const id = typed.startsWith("net:") ? netReference(typed).id : resolveFileResourceReference(typed, cwd ?? this.authority.participantRoot(participantId), this.authority.base, this.authority.privateRoots).id;
+			input = `${read ? "&" : ""}${id}`;
+			const current = this.authority.authoritySnapshot(participantId);
+			const state = this.authority.snapshot();
+			const filePath = typed.startsWith("file:") ? resolveFileResourceReference(typed, cwd ?? this.authority.participantRoot(participantId), this.authority.base, this.authority.privateRoots).path : undefined;
+			if (current.owned.includes(id) || (read && current.pointers.includes(id)) || (filePath !== undefined && (read ? canReadPath(state, participantId, filePath) : canWritePath(state, participantId, filePath)))) return { status: "granted", targetId, resources: [id] };
+			if (this.authority.participant(targetId)?.permissionMode === "all-of-mine") {
+				try {
+					const result = await this.give(targetId, participantId, input, cwd ?? this.authority.participantRoot(participantId));
+					return { status: "granted", targetId, resources: result.moved, fileUpdates: result.fileUpdates };
+				} catch (error) {
+					return { status: "unavailable", targetId, resources: [], reason: error instanceof Error ? error.message : String(error) };
+				}
+			}
+			const operationId = await this.send(participantId, targetId, `[Linden permission request]\n${participantId} requests ${input}. This request grants no authority. Approve with give after checking current permissions.`);
+			return { status: "pending", targetId, resources: [], operationId };
+		}
+		if (input.startsWith("&")) throw new Error("Parent-side get takes complete ownership; & is only accepted when requesting from parent");
+		const resolved = await this.resolveOwnedChildResource(participantId, targetId, input, cwd);
+		const receipt = await this.getOwnedResourceWithReceipt(participantId, targetId, resolved.resourceId);
+		await this.flushRuntimeEvents();
+		return { status: "granted", targetId, resources: receipt.resources, fileUpdates: receipt.fileUpdates };
+	}
+
+	async flushRuntimeEvents(): Promise<void> {
+		if (this.runtimeEventFlush) return this.runtimeEventFlush;
+		this.runtimeEventFlush = this.deliverRuntimeEvents().finally(() => { this.runtimeEventFlush = undefined; });
+		return this.runtimeEventFlush;
+	}
+
+	private async deliverRuntimeEvents(): Promise<void> {
+		const attempted = new Set<string>();
+		while (!this.disposed) {
+			const event = this.authority.snapshot().runtimeEvents?.find((candidate) => !candidate.delivered && !attempted.has(candidate.id) && this.authority.participant(candidate.participantId)?.kind === "agent");
+			if (!event) break;
+			attempted.add(event.id);
+			try {
+				await this.restoreParticipant(event.participantId);
+				const runtime = this.runtimes.get(event.participantId);
+				if (!runtime?.appendRuntimeNotice) continue;
+				this.interruptWaitsForMessage(event.participantId, event.id);
+				// Persist notices without starting a model turn or steering tools.
+				const persisted = runtime.entries?.().some((entry) => entry.type === "custom_message" && (entry as any).details?.eventId === event.id);
+				if (!persisted) await runtime.appendRuntimeNotice(event.text, { continueLoop: false, kind: event.kind as RuntimeNoticeOptions["kind"], eventId: event.id });
+				await this.authority.acknowledgeRuntimeEvent(event.id);
+			} catch (error) {
+				this.emitRuntimeWarning("LINDEN_POST_COMMIT_ADAPTER_FAILED", `Runtime message ${event.id} remains pending`, error);
+			}
+		}
 	}
 
 	/**
@@ -1019,8 +1092,9 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 	 * identities need not already be materialized in the ledger.
 	 */
 	private async resolveGrantResource(participantId: ParticipantId, input: string, mode: "move" | "read", cwd?: string): Promise<ResourceId> {
-		if (input.startsWith("web:")) return this.authority.materializeWeb(participantId, input);
-		const resolved = resolveFileResourceReference(input, cwd ?? this.authority.base, this.authority.base, this.authority.privateRoots);
+		if (input.startsWith("net:")) return this.authority.materializeNet(participantId, input);
+		if (input.startsWith("web:")) throw new Error("Web is historical; use net:tcp/<endpoint>:<port>");
+		const resolved = resolveFileResourceReference(input, cwd ?? this.authority.participantRoot(participantId), this.authority.base, this.authority.privateRoots);
 		const known = this.authority.resource(resolved.id as ResourceId);
 		if (known) return known.id;
 		const exists = existsSync(resolved.path);
@@ -1100,6 +1174,7 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 		const source = this.messageRuntime(participantId);
 		await this.restoreParticipant(targetId);
 		const message = await this.authority.sendWithPayload(participantId, targetId, async (messageId) => source.appendEntry<MailPayload>(PAYLOAD_ENTRY, { messageId, senderId: participantId, payload }), "steering");
+		this.interruptWaitsForMessage(targetId, message.id);
 		try { await this.activateMailbox(targetId); }
 		catch (error) {
 			this.emitRuntimeWarning(
@@ -1235,6 +1310,10 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 	 * get never aborts, stops, or wakes an idle Agent.
 	 */
 	async getOwnedResource(participantId: ParticipantId, expectedOwnerId: ParticipantId, resourceId: ResourceId): Promise<ResourceId[]> {
+		return (await this.getOwnedResourceWithReceipt(participantId, expectedOwnerId, resourceId)).resources;
+	}
+
+	private async getOwnedResourceWithReceipt(participantId: ParticipantId, expectedOwnerId: ParticipantId, resourceId: ResourceId): Promise<AuthorityTransferReceipt> {
 		expectedOwnerId = this.resolveParticipantRef(expectedOwnerId);
 		this.authority.requireGetParticipant(participantId, expectedOwnerId);
 		const resource = this.authority.resource(resourceId);
@@ -1244,7 +1323,7 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 			throw new Error(`TERM_EPOCH_ACTIVE: ${expectedOwnerId} still has an open epoch; leave required background work running, or explicitly stop the Term before get`);
 		}
 		if (this.authority.participant(expectedOwnerId)?.kind !== "agent") {
-			return this.authority.get(participantId, expectedOwnerId, resourceId);
+			return this.authority.getWithReceipt(participantId, expectedOwnerId, resourceId);
 		}
 		if (this.contextNavigationBlocks.has(expectedOwnerId)) throw new Error(`Linden context rewind is pending for ${expectedOwnerId}; retry get after navigation completes`);
 
@@ -1255,14 +1334,14 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 				|| this.agentLoops.has(expectedOwnerId)
 				|| (this.activeTools.get(expectedOwnerId) ?? 0) > 0;
 			await this.waitForActiveToolCompletion(expectedOwnerId);
-			const moved = await this.authority.get(participantId, expectedOwnerId, resourceId);
+			const receipt = await this.authority.getWithReceipt(participantId, expectedOwnerId, resourceId);
 			const runtimeAfter = this.runtimes.get(expectedOwnerId);
 			const shouldContinue = wasRunning
 				|| (runtimeAfter?.isRunning() ?? false)
 				|| this.agentLoops.has(expectedOwnerId);
-			const noticeDelivery = this.deliverAgentAuthorityTransferNotice(participantId, expectedOwnerId, moved, shouldContinue, runtimeAfter);
+			const noticeDelivery = this.flushRuntimeEvents();
 			if (!shouldContinue) await noticeDelivery;
-			return moved;
+			return receipt;
 		} finally {
 			this.endAuthorityTransfer(expectedOwnerId);
 		}
@@ -1285,37 +1364,6 @@ export class PiCoordinator implements ParticipantCoordinatorApi {
 			if (Date.now() > deadline) throw new Error(`Timed out waiting for ${participantId} to finish its current tool before ${operation}`);
 			await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 25));
 		}
-	}
-
-	private deliverAgentAuthorityTransferNotice(
-		participantId: ParticipantId,
-		targetId: ParticipantId,
-		resources: ResourceId[],
-		continueLoop: boolean,
-		runtime: ParticipantRuntime | undefined,
-	): Promise<void> {
-		const notice = `[Linden authority update] ${participantId} reclaimed ${resources.join(", ")}. The transfer is already committed.
-
-${this.describeAuthority(targetId)}
-
-${continueLoop ? "Continue your current task" : "When you next run, continue your task"} from this updated ledger state; do not assume write authority for the reclaimed resource unless it is granted again.`;
-		const delivery = (async () => {
-			let targetRuntime = runtime;
-			if (!targetRuntime?.appendRuntimeNotice) {
-				await this.restoreParticipant(targetId);
-				targetRuntime = this.runtimes.get(targetId);
-			}
-			if (!targetRuntime?.appendRuntimeNotice) throw new Error(`Participant ${targetId} cannot append an authority-change notice`);
-			await targetRuntime.appendRuntimeNotice(notice, { continueLoop, kind: "authority-change" });
-		})().catch((error) => {
-			this.emitRuntimeWarning(
-				"LINDEN_POST_COMMIT_ADAPTER_FAILED",
-				`get from ${targetId} committed, but its Agent runtime could not receive the authority update`,
-				error,
-			);
-		});
-		this.trackBackgroundOperation(delivery);
-		return delivery;
 	}
 
 	private async waitForStopCompletion(participantId: ParticipantId): Promise<void> {
@@ -1441,7 +1489,7 @@ ${continueLoop ? "Continue your current task" : "When you next run, continue you
 		participant = this.authority.participant(targetId)!;
 		const runtime = this.agentRuntime(targetId);
 		const checkpoint = this.nearestAgentState(targetId, runtime.leafId() ?? undefined);
-		return `${targetId} kind=Agent lifecycle=${participant.status}\n${runtime.summary()}\nnearest-rewindable-agent-state=${checkpoint?.id ?? "none"}`;
+		return `${targetId} kind=Agent lifecycle=${participant.status} branch=${this.authority.agentBranches(targetId).current}\n${runtime.summary()}\nnearest-rewindable-agent-state=${checkpoint?.id ?? "none"}`;
 	}
 
 	listenParticipant(participantId: ParticipantId, targetId: string, options?: ListenParticipantOptions): Promise<string> { return this.listen(participantId, targetId, options); }
@@ -1592,6 +1640,48 @@ ${continueLoop ? "Continue your current task" : "When you next run, continue you
 		});
 	}
 
+	async publishNet(participantId: string, reference: string, input: string, internalPort: number): Promise<string> {
+		const termId = this.resolveParticipantRef(reference);
+		const resourceId = await this.authority.materializeNet(participantId, input);
+		this.authority.requireListen(participantId, termId);
+		const runtime = await this.ensureTermRuntime(termId);
+		return this.authority.publishNet(participantId, resourceId, termId, internalPort, () => runtime.term.publishPort(resourceId, internalPort), () => runtime.term.unpublishPort(resourceId));
+	}
+
+	async unpublishNet(participantId: string, input: string): Promise<void> {
+		const resourceId = netReference(input).id;
+		await this.authority.unpublishNet(participantId, resourceId, async (termId) => (await this.ensureTermRuntime(termId)).term.unpublishPort(resourceId));
+	}
+
+	async unarchive(participantId: string, targetId: string): Promise<string[]> {
+		const restored = await this.withTopologyLock(() => this.authority.unarchiveParticipant(participantId, targetId));
+		await this.flushRuntimeEvents();
+		return restored;
+	}
+
+	async fork(participantId: string, sourceId: string, name?: string): Promise<string> {
+		const source = this.authority.participant(sourceId) ?? this.authority.participantTombstone(sourceId);
+		if (!source || source.kind !== "agent" || !source.sessionFile || source.parentId !== participantId) throw new Error("Fork requires a live or retained direct-child Agent");
+		const original = this.openPersistedSessionManager(sourceId, source.sessionFile).manager;
+		const session = this.createPersistedSessionManager(join(this.authority.stateDir, "pi-sessions"), source.sessionFile, this.authority.participantRoot(participantId));
+		const file = session.getSessionFile()!;
+		const header = JSON.parse(readFileSync(file, "utf8").split("\n")[0]);
+		const branch = original.getBranch().filter((entry) => entry.type !== "label" && !(entry.type === "custom" && entry.customType.startsWith("linden-")));
+		const idMap = new Map(branch.map((entry) => [entry.id, randomUUID()]));
+		let parentId: string | null = null;
+		const entries = branch.map((entry) => {
+			const copy: any = { ...structuredClone(entry), id: idMap.get(entry.id), parentId };
+			if (copy.type === "compaction" && idMap.has(copy.firstKeptEntryId)) copy.firstKeptEntryId = idMap.get(copy.firstKeptEntryId);
+			parentId = copy.id;
+			return copy;
+		});
+		writeFileSync(file, [header, ...entries].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+		const forked = SessionManager.open(file, join(this.authority.stateDir, "pi-sessions"));
+		// The notice is part of the new history before a runtime can be published.
+		forked.appendCustomMessageEntry(RUNTIME_NOTICE, `[Linden fork] Forked from ${sourceId}. This is a new Agent with no File or Net permissions, no children, no active processes, and no pending tasks. Historical IDs and permission statements are context only. Acquire current authority from your parent before working.`, true, { kind: "fork" });
+		return this.runLifecycleOperation(() => this.spawnNow(participantId, name, undefined, [], false, forked.getCwd(), true, forked));
+	}
+
 	async archive(participantId: ParticipantId, targetId: string): Promise<void> {
 		targetId = this.resolveParticipantRef(targetId);
 		await this.refreshLifecycleStatuses();
@@ -1689,17 +1779,44 @@ ${continueLoop ? "Continue your current task" : "When you next run, continue you
 		return this.stopRequests.size > 0;
 	}
 
-	async rewind(
+	async branch(participantId: ParticipantId, targetId: ParticipantId, name: string, stateId?: VersionId): Promise<void> {
+		await this.navigateAgentHistory(participantId, targetId, { kind: "branch", name, stateId });
+	}
+
+	async switchBranch(participantId: ParticipantId, targetId: ParticipantId, name: string): Promise<void> {
+		await this.navigateAgentHistory(participantId, targetId, { kind: "switch", name });
+	}
+
+	/** Human /tree selections may point to raw Pi entries; anchor them exactly. */
+	async rewindPiEntry(participantId: ParticipantId, targetId: ParticipantId, entryId: string, sessionManager: SessionManager, navigate?: (entryId: string) => Promise<void>): Promise<void> {
+		await this.navigateAgentHistory(participantId, targetId, { kind: "tree", entryId, sessionManager }, navigate);
+	}
+
+	async rewind(participantId: ParticipantId, targetId: ParticipantId, stateId: VersionId, navigateOverride?: (entryId: string) => Promise<void>): Promise<void> {
+		await this.navigateAgentHistory(participantId, targetId, { kind: "rewind", stateId }, navigateOverride);
+	}
+
+	isHistoryNavigationPending(participantId: ParticipantId): boolean {
+		return this.contextNavigationBlocks.has(participantId);
+	}
+
+	private async navigateAgentHistory(
 		participantId: ParticipantId,
 		targetId: ParticipantId,
-		stateId: VersionId,
+		operation: { kind: "branch"; name: string; stateId?: VersionId } | { kind: "switch"; name: string } | { kind: "rewind"; stateId: VersionId } | { kind: "tree"; entryId: string; sessionManager: SessionManager },
 		navigateOverride?: (entryId: string) => Promise<void>,
 	): Promise<void> {
 		targetId = this.resolveParticipantRef(targetId);
-		const node = this.authority.requireRewind(participantId, targetId, stateId);
-		if (this.contextNavigationBlocks.has(targetId)) throw new Error(`Linden context rewind is already pending for ${targetId}`);
-		if ((this.authorityTransferBlocks.get(targetId) ?? 0) > 0) throw new Error(`Linden authority transfer is pending for ${targetId}; retry rewind after it completes`);
-		if (this.stopRequests.has(targetId) || this.stopping.has(targetId)) throw new Error(`Linden stop is pending for ${targetId}; retry rewind after it completes`);
+		const branches = this.authority.agentBranches(targetId);
+		if (operation.kind === "branch") this.authority.requireNewAgentBranch(targetId, operation.name);
+		let stateId = operation.kind === "switch" ? this.authority.agentBranchHead(targetId, operation.name)
+			: operation.kind === "tree" ? branches.heads[branches.current] : operation.stateId ?? branches.heads[branches.current];
+		if (!stateId) throw new Error(`AGENT_HISTORY_EMPTY: ${targetId} has no typed checkpoint yet`);
+		this.authority.requireRewind(participantId, targetId, stateId);
+		if (this.contextNavigationBlocks.has(targetId)) throw new Error(`Linden context navigation is already pending for ${targetId}`);
+		if ((this.authorityTransferBlocks.get(targetId) ?? 0) > 0) throw new Error(`Linden authority transfer is pending for ${targetId}; retry ${operation.kind} after it completes`);
+		if (this.stopRequests.has(targetId) || this.stopping.has(targetId)) throw new Error(`Linden stop is pending for ${targetId}; retry ${operation.kind} after it completes`);
+		if (operation.kind === "switch" && branches.current === operation.name) return;
 
 		this.contextNavigationBlocks.add(targetId);
 		try {
@@ -1707,27 +1824,81 @@ ${continueLoop ? "Continue your current task" : "When you next run, continue you
 			const runtime = this.runtime(targetId);
 			const navigate = navigateOverride ?? (runtime.navigate ? runtime.navigate.bind(runtime) : undefined);
 			if (!navigate || !runtime.appendRuntimeNotice) throw new Error(`Participant ${targetId} does not expose controllable Pi tree navigation`);
-			const wasRunning = runtime.isRunning()
-				|| this.agentLoops.has(targetId)
-				|| (this.activeTools.get(targetId) ?? 0) > 0;
+			const wasRunning = runtime.isRunning() || this.agentLoops.has(targetId) || (this.activeTools.get(targetId) ?? 0) > 0;
 			await this.waitForActiveToolCompletion(targetId, "rewind");
 			if (wasRunning || runtime.isRunning() || this.agentLoops.has(targetId)) {
 				await runtime.abort();
 				await this.waitForAgentForegroundIdle(targetId);
 			}
-			await navigate(node.piEntryId);
-			const rewindEffect = await this.authority.commitRewind(participantId, targetId, stateId);
-			await this.appendRewindNoticeAfterCommit(targetId, stateId, node.piEntryId, rewindEffect.sequence);
+			// Seal all persisted messages before leaving the source branch. This also
+			// gives "branch from current" an exact typed anchor for Pi navigation.
+			const source = await this.sealAgentContext(targetId);
+			const sourceLeafId = this.agentRuntime(targetId).leafId() ?? source.piEntryId;
+			const recoverNavigate = runtime.navigate?.bind(runtime) ?? navigate;
+			if (operation.kind === "tree") {
+				const manager = operation.sessionManager;
+				if (manager.getSessionId() !== runtime.piSessionId) throw new Error("STATE_SCOPE_MISMATCH: Pi session does not belong to this Agent");
+				const entry = manager.getEntry(operation.entryId);
+				if (!entry) throw new Error(`Unknown Pi entry ${operation.entryId}`);
+				const existing = Object.values(this.authority.snapshot().agentStates).find((node) => node.participantId === targetId && node.piEntryId === entry.id);
+				if (existing && entry.type !== "custom_message" && !(entry.type === "message" && entry.message.role === "user")) stateId = existing.id;
+				else {
+					const parentState = this.nearestAgentState(targetId, entry.id);
+					const historical = parentState ? this.authority.snapshot().checkpoints[parentState.checkpointId] : undefined;
+					const envelope = this.authority.checkpointEnvelope(targetId);
+					if (historical) { envelope.ledgerSequence = historical.ledgerSequence; envelope.authority = historical.authority; }
+					try {
+						manager.branch(entry.id);
+						const anchorId = manager.appendCustomEntry(CHECKPOINT_ENTRY, { ...envelope, toolName: "tree-anchor" });
+						const anchor = await this.authority.recordCheckpoint(envelope, anchorId, entry.id, parentState?.id, false);
+						stateId = anchor.id;
+						manager.branch(sourceLeafId);
+					} catch (error) {
+						await recoverNavigate(source.piEntryId);
+						throw error;
+					}
+				}
+			}
+			if (operation.kind === "branch" && operation.stateId === undefined) stateId = source!.id;
+			const node = this.authority.requireRewind(participantId, targetId, stateId);
+			if (operation.kind === "branch") this.authority.requireNewAgentBranch(targetId, operation.name);
+			let effect;
+			try {
+				await navigate(node.piEntryId);
+				effect = await this.authority.commitAgentNavigation(participantId, targetId, stateId,
+					operation.kind === "rewind" || operation.kind === "tree" ? undefined : { name: operation.name, create: operation.kind === "branch" });
+			} catch (error) {
+				if (source) await recoverNavigate(source.piEntryId);
+				throw error;
+			}
+			await this.appendRewindNoticeAfterCommit(targetId, stateId, node.piEntryId, effect.sequence);
 		} finally {
 			const activateDeferredMailbox = this.mailboxActivationDeferredByNavigation.delete(targetId);
 			this.contextNavigationBlocks.delete(targetId);
 			await this.refreshLifecycleStatuses().catch(() => undefined);
 			if (activateDeferredMailbox && this.authority.participant(targetId)) {
 				this.trackBackgroundOperation(this.activateMailbox(targetId).catch((error) => {
-					this.emitRuntimeWarning("LINDEN_POST_COMMIT_ADAPTER_FAILED", `Mailbox activation after context rewind failed for ${targetId}`, error);
+					this.emitRuntimeWarning("LINDEN_POST_COMMIT_ADAPTER_FAILED", `Mailbox activation after context navigation failed for ${targetId}`, error);
 				}));
 			}
 		}
+	}
+
+	private async sealAgentContext(participantId: ParticipantId): Promise<AgentStateNode> {
+		const runtime = this.agentRuntime(participantId);
+		const branches = this.authority.agentBranches(participantId);
+		const head = this.authority.snapshot().agentStates[branches.heads[branches.current]];
+		const entries = new Map(runtime.entries().map((entry) => [entry.id, entry]));
+		let cursor = runtime.leafId();
+		const seen = new Set<string>();
+		while (cursor && !seen.has(cursor)) {
+			if (cursor === head?.piEntryId) return head;
+			seen.add(cursor);
+			const entry = entries.get(cursor);
+			if (entry?.type !== "label") break;
+			cursor = entry.parentId;
+		}
+		return (await this.appendCheckpoint(participantId, "history-navigation"))!;
 	}
 
 	private async waitForAgentForegroundIdle(participantId: ParticipantId): Promise<void> {
@@ -1904,18 +2075,21 @@ ${continueLoop ? "Continue your current task" : "When you next run, continue you
 			return exclusions.length ? `${include} - ${exclusions.join(" - ")}` : include;
 		};
 		return [
-			`session: ${state.sessionId}`,
-			`base: ${state.base}`,
+			`workspace: ${state.sessionId}`,
+			`root: ${state.base}`,
 			`max Agent depth: ${formatMaxAgentDepth(this.authority.maxAgentDepth)}`,
 			`participant depth: ${this.authority.participantDepth(targetId)}`,
 			`participant: ${targetId}`,
 			`parent: ${participant.parentId ?? "none"}`,
 			`children: ${participant.childIds.join(", ") || "none"}`,
+			`held: ${authoritySummary(state, [targetId])}`,
+			`managed: ${authoritySummary(state, managedParticipants(state, targetId))}`,
+			`permission: ${participant.permissionMode ?? "manual"}`,
 			`owned resources: ${snapshot.owned.join(", ") || "none"}`,
 			`read pointers: ${snapshot.pointers.join(", ") || "none"}`,
 			`effective write regions: ${effective.writeExpressions.map(formatFileExpression).join(", ") || "none"}`,
 			`effective read regions: ${effective.readExpressions.map(formatFileExpression).join(", ") || "none"}`,
-			`effective Web selectors: ${effective.webDomains.join(", ") || "none"}`,
+			`effective Net endpoints: ${(effective.netEndpoints ?? []).join(", ") || "none"}`,
 		].join("\n");
 	}
 
@@ -1975,6 +2149,7 @@ ${continueLoop ? "Continue your current task" : "When you next run, continue you
 		await this.restoreParticipant(targetId);
 		const runtime = this.agentRuntime(targetId);
 		const entries = runtime.entries();
+		const branches = this.authority.agentBranches(targetId);
 		const nodesByEntry = new Map(nodes.map((node) => [node.piEntryId, node]));
 		const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
 		const nearestByEntry = new Map<string, AgentStateNode | undefined>();
@@ -1994,11 +2169,14 @@ ${continueLoop ? "Continue your current task" : "When you next run, continue you
 			for (const id of chain) nearestByEntry.set(id, nearest);
 			return nearest;
 		};
-		return entries.map((entry) => {
+		const tree = entries.map((entry) => {
 			const typed = nodesByEntry.get(entry.id);
 			const nearest = nearestFor(entry.id);
-			return `${entry.id === runtime.leafId() ? "*" : " "} pi-id=${entry.id} parent-pi-id=${entry.parentId ?? "none"} rewindable=${typed ? "yes" : "no"} typed-state=${typed?.id ?? "none"} nearest-typed-state=${nearest?.id ?? "none"} summary=${entryText(entry)}`;
+			const names = Object.entries(branches.heads).filter(([, head]) => head === typed?.id).map(([name]) => name === branches.current ? `${name} (current)` : name);
+			return `${entry.id === runtime.leafId() ? "*" : " "} pi-id=${entry.id} parent-pi-id=${entry.parentId ?? "none"} rewindable=${typed ? "yes" : "no"} typed-state=${typed?.id ?? "none"} nearest-typed-state=${nearest?.id ?? "none"}${names.length ? ` branches=${names.join(",")}` : ""} summary=${entryText(entry)}`;
 		}).join("\n") || "No Pi entries.";
+		const refs = Object.entries(branches.heads).map(([name, id]) => `${name === branches.current ? "*" : " "} ${name} -> ${id} (pi-id=${nodes.find((node) => node.id === id)?.piEntryId ?? "none"})`);
+		return `Current branch: ${branches.current}\nBranches:\n${refs.join("\n") || "none"}\n${tree}`;
 	}
 
 	private readMailPayload(record: MessageRecord, coldSessions: Map<ParticipantId, SessionManager>): MailPayload | undefined {
@@ -2015,11 +2193,11 @@ ${continueLoop ? "Continue your current task" : "When you next run, continue you
 		return customEntry(manager.getEntry(record.payloadEntryId));
 	}
 
-	private nearestAgentState(participantId: ParticipantId, startPiEntryId: string | undefined): AgentStateNode | undefined {
+	private nearestAgentState(participantId: ParticipantId, startPiEntryId: string | undefined, persistedEntries?: SessionEntry[]): AgentStateNode | undefined {
 		if (!startPiEntryId) return undefined;
 		const state = this.authority.snapshot();
 		const nodesByEntry = new Map(Object.values(state.agentStates).filter((node) => node.participantId === participantId).map((node) => [node.piEntryId, node]));
-		const entries = new Map(this.agentRuntime(participantId).entries().map((entry) => [entry.id, entry]));
+		const entries = new Map((persistedEntries ?? this.agentRuntime(participantId).entries()).map((entry) => [entry.id, entry]));
 		let cursor: string | null = startPiEntryId;
 		const seen = new Set<string>();
 		while (cursor) {
@@ -2320,5 +2498,5 @@ export function summarizeMessage(payload: string, maxCharacters = 120): string {
 function randomId(): string { return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`; }
 
 export function toolNames(): string[] {
-	return ["read", "write", "edit", "bash", "stat", "spawn", "send", "steer", "listen", "wait", "interrupt", "stop", "exec", "input", "receive", "participants", "give", "get", "checkout", "rewind", "log", "archive", "authority"];
+	return ["read", "write", "edit", "bash", "stat", "spawn", "send", "steer", "listen", "wait", "interrupt", "stop", "exec", "input", "receive", "participants", "give", "get", "checkout", "branch", "switch", "rewind", "log", "archive", "unarchive", "fork", "permission", "publish", "unpublish", "authority"];
 }

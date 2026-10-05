@@ -9,11 +9,13 @@ import {
 	type CreateAgentSessionRuntimeFactory,
 	type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
+import { createInterface } from "node:readline";
 import { SessionAuthorityManager } from "../runtime/manager.js";
 import type { ParticipantId, ResourceId } from "../runtime/model.js";
 import { SessionLease, SessionRegistry, type SessionManifest } from "../runtime/sessions.js";
 import { stateDirectory } from "../runtime/store.js";
 import { normalizeMaxAgentDepth } from "../runtime/agent-depth.js";
+import { registerLindenHooks } from "./hooks.js";
 import { buildTools } from "./tools.js";
 import {
 	type ParticipantWaitTarget,
@@ -22,8 +24,6 @@ import {
 } from "./participant-api.js";
 import {
 	PiCoordinator,
-	needsParticipantTreeBirthSnapshot,
-	runtimeGuidanceForParticipant,
 	summarizeMessage,
 	toolNames,
 	type DeliveredMail,
@@ -36,7 +36,8 @@ export interface StandalonePiHostOptions {
 	workspace?: string;
 	session?: string;
 	stateRoot?: string;
-	webDomains?: string[];
+	permissions?: readonly string[];
+	noDefaultPermissions?: boolean;
 	/** Maximum Agent edge depth below the human root for a new session. */
 	maxAgentDepth?: number;
 	/** Evaluator-scoped ports bridged from isolated Term namespaces to parent loopback. */
@@ -113,7 +114,7 @@ export class StandalonePiHost {
 		const requestedMaxAgentDepth = normalizeMaxAgentDepth(options.maxAgentDepth);
 		let manifest = options.session
 			? registry.resolve(options.session)
-			: registry.create(options.base ?? options.workspace ?? process.cwd(), undefined, { maxAgentDepth: requestedMaxAgentDepth });
+			: registry.create(options.base ?? options.workspace ?? process.cwd(), undefined, { maxAgentDepth: requestedMaxAgentDepth, permissions: options.permissions, noDefaultPermissions: options.noDefaultPermissions });
 		if (options.session && requestedMaxAgentDepth !== undefined && manifest.maxAgentDepth !== requestedMaxAgentDepth) {
 			throw new Error(`Linden session maxAgentDepth is ${manifest.maxAgentDepth ?? "unlimited"}, not ${requestedMaxAgentDepth}`);
 		}
@@ -126,13 +127,15 @@ export class StandalonePiHost {
 		let host: StandalonePiHost | undefined;
 		try {
 			manifest = registry.touch(manifest);
-			const authority = await SessionAuthorityManager.open({ base: manifest.base, lindenSessionId: manifest.id, webDomains: options.webDomains, maxAgentDepth: manifest.maxAgentDepth, stateRoot: registry.root, stateDir: stateDirectory(manifest.id, registry.root), sandboxTmpPath: options.sandboxTmpPath });
+			const authority = await SessionAuthorityManager.open({ base: manifest.base, lindenSessionId: manifest.id, permissions: manifest.permissions, maxAgentDepth: manifest.maxAgentDepth, stateRoot: registry.root, stateDir: stateDirectory(manifest.id, registry.root), sandboxTmpPath: options.sandboxTmpPath });
+			await authority.unarchiveWorkspace();
 			host = new StandalonePiHost(authority, registry, manifest, lease, options.onHumanMessage, options.termLoopbackPorts, options.runtimeGuidanceProfile);
 			// Restore exactly the Agents the previous Linden process saved as active.
 			// Terms deliberately have no process handle to restore: coordinator.dispose()
 			// stops and reconciles them, and a later Term operation reconstructs its
 			// stopped runtime from the durable participant record on demand.
 			await host.coordinator.restoreChildren(authority.loadProcessState()?.activeAgents ?? []);
+			await host.coordinator.flushRuntimeEvents();
 			return host;
 		} catch (error) {
 			try {
@@ -166,19 +169,90 @@ export class StandalonePiHost {
 	}
 
 	async attach(reference: string): Promise<{ participantId: ParticipantId; consumed: DeliveredMail[] }> {
-		// Attach is Agent-specific. Terms are observed and controlled through the
-		// generic listen/wait/exec/input surface instead of a Pi UI.
+		const resolved = this.coordinator.resolveParticipantRef(reference);
+		if (this.authority.participant(resolved)?.kind === "term") return this.attachTerm(resolved);
 		const targetId = await this.ensureRuntime(reference);
 		const prepared = await this.coordinator.prepareAttach(this.authority.rootParticipantId, targetId);
 		const runtime = this.coordinator.hostedRuntime(prepared.targetId);
 		this.attachedParticipantId = prepared.targetId;
+		const restoreTreeNavigation = this.routeAttachedTree(prepared.targetId);
 		try {
 			const ui = new InteractiveMode(runtime.runtimeHost, { verbose: false, detachable: true });
 			await ui.run();
 		} finally {
+			restoreTreeNavigation();
 			if (this.attachedParticipantId === prepared.targetId) this.attachedParticipantId = undefined;
 		}
 		return { participantId: prepared.targetId, consumed: prepared.consumed };
+	}
+
+	/** Keep Pi's tree UI, but route Human selections through Linden's current branch. */
+	routeAttachedTree(participantId: ParticipantId): () => void {
+		const session = this.coordinator.hostedRuntime(participantId).runtimeHost.session;
+		const original = session.navigateTree;
+		const manager = session.sessionManager;
+		const originalTree = manager.getTree;
+		manager.getTree = () => {
+			const tree = originalTree.call(manager);
+			const state = this.authority.snapshot();
+			const branches = this.authority.agentBranches(participantId);
+			const heads = new Map<string, string[]>();
+			for (const [name, id] of Object.entries(branches.heads)) {
+				const entryId = state.agentStates[id]?.piEntryId;
+				if (entryId) heads.set(entryId, [...heads.get(entryId) ?? [], name === branches.current ? `${name} (current)` : name]);
+			}
+			const decorate = (nodes: typeof tree): void => {
+				for (const node of nodes) {
+					const names = heads.get(node.entry.id);
+					if (names) {
+						node.label = [node.label, `branches: ${names.join(", ")}`].filter(Boolean).join(" | ");
+						// Pi hides custom bookkeeping in its default tree filter. Present
+						// branch tips as visible markers in this view only.
+						if (node.entry.type === "custom") node.entry = { ...node.entry, type: "custom_message", customType: "linden:branch-head", content: `History checkpoint ${node.entry.id}`, display: true };
+					}
+					decorate(node.children);
+				}
+			};
+			decorate(tree);
+			return tree;
+		};
+		session.navigateTree = async (entryId, options) => {
+			if (this.coordinator.isHistoryNavigationPending(participantId)) return original.call(session, entryId, options);
+			let result: Awaited<ReturnType<typeof original>> | undefined;
+			try {
+				await this.coordinator.rewindPiEntry(this.authority.rootParticipantId, participantId, entryId, session.sessionManager, async (anchorId) => {
+					result = await original.call(session, anchorId, options);
+					if (result.cancelled) throw new Error("History navigation cancelled");
+				});
+			} catch (error) {
+				if (result?.cancelled) return result;
+				throw error;
+			}
+			return result ?? { cancelled: false };
+		};
+		return () => { session.navigateTree = original; manager.getTree = originalTree; };
+	}
+
+	private async attachTerm(participantId: string): Promise<{ participantId: string; consumed: DeliveredMail[] }> {
+		this.authority.requireListen(this.authority.rootParticipantId, participantId);
+		this.attachedParticipantId = participantId;
+		const input = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+		process.stdout.write(`Attached ${participantId}. Text executes in this Term; :input DATA, :inputln DATA, :listen, :authority, :detach.\n`);
+		try {
+			input.setPrompt("term> "); input.prompt();
+			for await (const line of input) {
+				if (line === ":detach" || line === ":exit") break;
+				try {
+					if (line === ":authority") process.stdout.write(this.coordinator.describeAuthority(this.authority.rootParticipantId, participantId) + "\n");
+					else if (line === ":listen") process.stdout.write(await this.coordinator.listenParticipant(this.authority.rootParticipantId, participantId) + "\n");
+					else if (line.startsWith(":inputln ")) await this.inputTerm(participantId, line.slice(9) + "\n");
+					else if (line.startsWith(":input ")) await this.inputTerm(participantId, line.slice(7));
+					else if (line.trim()) await this.execTerm(participantId, line);
+				} catch (error) { process.stdout.write(`${error instanceof Error ? error.message : error}\n`); }
+				input.prompt();
+			}
+		} finally { input.close(); this.attachedParticipantId = undefined; }
+		return { participantId, consumed: [] };
 	}
 
 	/** Ensure an Agent has a live Pi runtime. Terms are never attachable. */
@@ -294,7 +368,11 @@ export class StandalonePiHost {
 			// If a hosted runtime failed to dispose, retaining the lease prevents a
 			// second host from overlapping with work that may still be live.
 			if (coordinatorClean) {
-				try { this.lease.release(); } catch (error) { failures.push(error); }
+				try {
+					await this.authority.setParticipantStatuses(this.authority.listParticipants().map((participant) => [participant.id, "stopped"] as const));
+					await this.authority.archiveWorkspace();
+					this.lease.release();
+				} catch (error) { failures.push(error); }
 			}
 			if (failures.length) throw new AggregateError(failures, "Standalone Linden host did not dispose cleanly");
 		})();
@@ -339,26 +417,12 @@ export class StandalonePiHost {
 
 	private lindenExtension(participantId: ParticipantId, sessionManager: SessionManager): ExtensionFactory {
 		return (pi) => {
-			const allowed = new Set(toolNames());
-			pi.on("tool_call", (event) => allowed.has(event.toolName) ? undefined : { block: true, reason: `Tool ${event.toolName} is not mediated by Linden authority` });
-			pi.on("before_agent_start", async (event) => {
-				const birthSnapshot = needsParticipantTreeBirthSnapshot(sessionManager.getEntries())
-					? `\n\n${await this.coordinator.formatParticipantTreeBirthSnapshot(participantId)}`
-					: "";
-				return {
-					systemPrompt: `${event.systemPrompt}\n\nLinden authority (the sole source of resource permissions):\nYou are participant ${participantId}.\n${this.coordinator.describeAuthority(participantId)}\nUse only the registered Linden gateways for files, Bash, messages, transfers, checkout, and child participants.${birthSnapshot}\n\n${runtimeGuidanceForParticipant(this.coordinator.isAgentSpawnEnabled(participantId), this.runtimeGuidanceProfile)}`,
-				};
+			registerLindenHooks(pi, () => ({ coordinator: this.coordinator, participantId }), {
+				sessionManager,
+				runtimeGuidanceProfile: this.runtimeGuidanceProfile,
 			});
 			pi.on("session_before_switch", () => ({ cancel: true }));
 			pi.on("session_before_fork", () => ({ cancel: true }));
-			pi.on("user_bash", () => ({
-				operations: {
-					exec: async (command: string, cwd: string, options: any) => {
-						const result = await this.authority.bash(participantId, command, { ...options, cwd });
-						return { exitCode: result.exitCode };
-					},
-				},
-			}));
 		};
 	}
 }

@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { sandboxRequirements } from "./runtime-requirements.js";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
 
-const hasBwrap = spawnSync("which", ["bwrap"], { stdio: "ignore" }).status === 0;
+const sandboxRuntime = await sandboxRequirements();
+const hasBwrap = sandboxRuntime.available;
 
 async function moveWorkspaceTo(manager: SessionAuthorityManager, participantId: string): Promise<void> {
 	await manager.give(manager.rootParticipantId, participantId, manager.baseResourceId());
@@ -147,7 +148,7 @@ test("an absent exact File can be delegated and subtracts that location from the
 		assert.equal(after.state, "Present");
 	} finally { rmSync(workspace, { recursive: true, force: true }); }
 });
-test("a modified absent-File placeholder is retained and marks the delegated File divergent", { skip: !hasBwrap }, async () => {
+test("a modified absent-File placeholder is retained and marks the delegated File divergent", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-absent-file-integrity-"));
 	const target = join(workspace, "guarded.txt");
 	try {

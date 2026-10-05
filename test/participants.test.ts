@@ -26,7 +26,7 @@ function stateWith(participants: ParticipantRecord[]): AuthorityState {
 	};
 }
 
-test("participant tree shows every kind and lifecycle without an archive view", () => {
+test("participant tree shows relationships, lifecycle and held permissions in compact columns", () => {
 	const state = stateWith([
 		{ id: "human:root", name: "root", kind: "human", status: "stopped", childIds: ["agent:lead"], createdAt: 1 },
 		{ id: "agent:lead", name: "lead", kind: "agent", status: "running", parentId: "human:root", childIds: ["term:shell"], createdAt: 2 },
@@ -36,9 +36,9 @@ test("participant tree shows every kind and lifecycle without an archive view", 
 
 	assert.equal(formatParticipants(state, "agent:lead"), [
 		"Agent depth limit: 3",
-		"root(human:root) [parent] [kind=Human, lifecycle=stopped]",
-		"└── lead(agent:lead) [self] [kind=Agent, lifecycle=running]",
-		"    └── shell(term:shell) [child] [kind=Term, lifecycle=ready]",
-		"        └── reviewer(human:reviewer) [descendant] [kind=Human, lifecycle=stopped]",
+		"root(human:root) | parent | stopped | file:/workspace/",
+		"└── lead(agent:lead) | self | running | none",
+		"    └── shell(term:shell) | child | ready | none",
+		"        └── reviewer(human:reviewer) | descendant | stopped | none",
 	].join("\n"));
 });

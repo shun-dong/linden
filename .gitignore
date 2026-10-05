@@ -1,5 +1,35 @@
+# Dependencies and generated build/test output
 node_modules/
 dist/
 .tmp-test/
-native/term-supervisor/target/
+.tmp-test-*/
+.linden/
+/native/term-supervisor/target/
+/native/term-supervisor/bin/
 *.log
+
+# Research materials and private local records are kept on dev only.
+/paper/
+/paper-arxiv/
+/paper-arxiv-source.tar.gz
+/ref/
+/submission-artifacts/
+/archive/
+/experiments/
+/doc/experiments/
+/doc/linden product design.md
+/doc/linden programming language.md
+/doc/linden runtime.md
+/doc/linden type theory.md
+/.codex-edit-stage/
+/log.jsonl
+/doc/validation/*.json
+/test/test.md
+/test/sub/
+/test/.*-marker.md
+
+# Editing and platform intermediates
+*.orig
+*:Zone.Identifier
+__pycache__/
+*.py[cod]

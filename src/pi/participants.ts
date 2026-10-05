@@ -1,3 +1,4 @@
+import { authoritySummary } from "../runtime/authority-display.js";
 import type { AuthorityState, ParticipantId, ParticipantRecord } from "../runtime/model.js";
 
 export type ParticipantDisplayName = (participant: ParticipantRecord) => string | undefined;
@@ -44,9 +45,8 @@ export function formatParticipants(
 		const relations = relationLabels(state, viewerId, node);
 		const name = cleanName(displayName(node) ?? node.name);
 		const connector = root ? "" : last ? "└── " : "├── ";
-		const kind = node.kind[0].toUpperCase() + node.kind.slice(1);
-		const relationTag = relations.length ? ` [${relations.join(", ")}]` : "";
-		lines.push(`${prefix}${connector}${name}(${node.id})${relationTag} [kind=${kind}, lifecycle=${node.status}]`);
+		const columns = [...relations, node.status, authoritySummary(state, [node.id])];
+		lines.push(`${prefix}${connector}${name}(${node.id}) | ${columns.join(" | ")}`);
 		const childPrefix = root ? "" : `${prefix}${last ? "    " : "│   "}`;
 		const children = node.childIds.filter((childId) => state.participants[childId]);
 		children.forEach((childId, index) => visit(childId, childPrefix, index === children.length - 1));

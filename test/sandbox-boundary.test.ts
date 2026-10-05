@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { sandboxRequirements } from "./runtime-requirements.js";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
 
-const hasBwrap = spawnSync("which", ["bwrap"], { stdio: "ignore" }).status === 0;
+const sandboxRuntime = await sandboxRequirements();
 
-test("sandbox hides host configuration and secrets while retaining the active Node toolchain", { skip: !hasBwrap }, async () => {
+test("sandbox hides host configuration and secrets while retaining the active Node toolchain", { skip: sandboxRuntime.skip }, async () => {
 	// WSL may inherit a Windows TEMP under /mnt/c. An authorized workspace there
 	// necessarily materializes /mnt as a directory skeleton, making the /mnt
 	// visibility assertion self-contradictory. bwrap is Linux-only, so use the

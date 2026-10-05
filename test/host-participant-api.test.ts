@@ -15,7 +15,7 @@ test("standalone top-level Agent receives the complete birth topology on its fir
 	const host = Object.assign(Object.create(StandalonePiHost.prototype), { coordinator }) as StandalonePiHost;
 	const extension = (host as any).lindenExtension("agent:top-level", { getEntries: () => entries });
 	extension({ on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); } });
-	tree = "root(human:root)\n├── lead(agent:top-level) [self]\n└── peer(agent:peer)";
+	tree = "root(human:root) | parent | stopped | none\n├── lead(agent:top-level) | self | stopped | none\n└── peer(agent:peer) | stopped | none";
 
 	const first = (await handlers.get("before_agent_start")?.({ systemPrompt: "base" })).systemPrompt as string;
 	assert.match(first, /Linden participant tree at Agent birth/);

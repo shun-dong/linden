@@ -1,6 +1,6 @@
 {
   "name": "linden-authority-runtime",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -14,9 +14,11 @@
 		"clean:test": "node -e \"require('node:fs').rmSync('.tmp-test',{recursive:true,force:true})\"",
 		"prebuild": "npm run build:term-supervisor",
 		"build": "npm run clean:build && tsc --project tsconfig.build.json",
+		"postbuild": "node -e \"for (const entry of ['dist/cli.js', 'dist/check-cli.js']) require('node:fs').chmodSync(entry, 0o755)\"",
 		"check": "tsc --project tsconfig.json",
 		"pretest": "npm run build:term-supervisor",
 		"test": "npm run clean:test && tsc --project tsconfig.test.json && node --test .tmp-test/test/*.test.js",
+		"test:live:luna": "node scripts/smoke-pi-luna.mjs",
 		"pretest:integration": "npm run build:term-supervisor",
 		"test:integration": "npm run clean:test && tsc --project tsconfig.test.json && node --test .tmp-test/test/integration.test.js .tmp-test/test/sandbox.test.js",
 		"dev": "pi --no-extensions -e ./src/pi/extension.ts"

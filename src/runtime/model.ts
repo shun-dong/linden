@@ -27,6 +27,8 @@ export interface ParticipantRecord {
 	sessionFile?: string;
 	status: ParticipantStatus;
 	createdAt: number;
+	rootDir?: string;
+	permissionMode?: "manual" | "all-of-mine";
 }
 
 /**
@@ -103,7 +105,7 @@ export interface VersionNode {
 	parentId?: VersionId;
 	snapshot: SnapshotRef;
 	participantId: ParticipantId;
-	operation: "initial" | "write" | "edit" | "bash" | "term" | "recovery";
+	operation: "initial" | "write" | "edit" | "bash" | "term" | "recovery" | "save";
 	createdAt: number;
 	piEntryId?: string;
 }
@@ -136,7 +138,16 @@ export interface WebResource extends ResourceBase {
 	derivedFrom?: ResourceId;
 }
 
-export type ResourceRecord = FileResource | FileRegionResource | WebResource;
+export interface NetResource extends ResourceBase {
+	kind: "net";
+	host: string;
+	port: number;
+	dns: boolean;
+	public: boolean;
+	derivedFrom?: ResourceId;
+}
+
+export type ResourceRecord = FileResource | FileRegionResource | WebResource | NetResource;
 
 export interface MessageRecord {
 	id: MessageId;
@@ -153,9 +164,11 @@ export interface MessageRecord {
 	consumedBy?: ParticipantId;
 	origin?: "explicit" | "assistant_final";
 	sourceEntryId?: string;
+	/** Retained unread mail after archive; explicit receive remains available. */
+	deferred?: boolean;
 }
 
-export type EffectKind = "participants" | "spawn" | "subpath" | "file" | "send" | "steer" | "wait" | "interrupt" | "stop" | "receive" | "give" | "get" | "write" | "edit" | "bash" | "exec" | "input" | "checkout" | "rewind" | "archive";
+export type EffectKind = "participants" | "spawn" | "subpath" | "file" | "send" | "steer" | "wait" | "interrupt" | "stop" | "receive" | "give" | "get" | "write" | "edit" | "bash" | "exec" | "input" | "checkout" | "rewind" | "archive" | "unarchive" | "permission" | "save" | "publish" | "unpublish";
 export interface EffectRecord {
 	id: EffectId;
 	sequence: number;
@@ -194,10 +207,42 @@ export interface AgentStateNode {
 	createdAt: number;
 }
 
+export interface AgentBranches {
+	current: string;
+	heads: Record<string, VersionId>;
+}
+
+export interface ArchiveTemplate {
+	participants: Record<ParticipantId, ParticipantRecord>;
+	contexts: AuthorityState["contexts"];
+	checkpoints: AuthorityState["checkpoints"];
+	agentStates: AuthorityState["agentStates"];
+	currentAgentStateIds: AuthorityState["currentAgentStateIds"];
+	agentBranches?: AuthorityState["agentBranches"];
+	messages: AuthorityState["messages"];
+	files: Record<string, SnapshotRef>;
+}
+
+export interface RuntimeEvent {
+	id: string;
+	participantId: ParticipantId;
+	text: string;
+	kind: string;
+	delivered?: boolean;
+}
+
 export interface AuthorityState {
-	schemaVersion: 6;
+	schemaVersion: 6 | 7 | 8;
 	sessionId: string;
 	base: string;
+	explicitAuthority?: boolean;
+	initialPermissions?: string[];
+	archived?: boolean;
+	archives?: Record<ParticipantId, ArchiveTemplate>;
+	workspaceContexts?: AuthorityState["contexts"];
+	workspaceFiles?: Record<string, SnapshotRef>;
+	saveBaseline?: Record<string, SnapshotRef>;
+	runtimeEvents?: RuntimeEvent[];
 	/** Maximum number of Agent nodes on a root-to-participant path; absent means unlimited. */
 	maxAgentDepth?: number;
 	createdAt: number;
@@ -214,6 +259,8 @@ export interface AuthorityState {
 	checkpoints: Record<CheckpointId, TypedCheckpoint>;
 	agentStates: Record<VersionId, AgentStateNode>;
 	currentAgentStateIds: Record<ParticipantId, VersionId>;
+	/** Branch references; currentAgentStateIds is the derived current-head index. */
+	agentBranches?: Record<ParticipantId, AgentBranches>;
 	/** Durable Term history reconstructed from optional v6 runtime metadata. */
 	termEpochs: Record<string, TermEpochRecord>;
 }
@@ -238,4 +285,6 @@ export interface EffectiveAuthority {
 	absentWriteFileExclusions: string[];
 	unsafeAbsentWriteExclusions: string[];
 	webDomains: string[];
+	netEndpoints?: string[];
+	netExclusions?: string[];
 }

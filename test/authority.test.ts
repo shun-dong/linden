@@ -3,7 +3,7 @@ import { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, wr
 import { tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
 import { fileResourceId } from "../src/runtime/paths.js";
 
 async function fixture() {
@@ -119,7 +119,7 @@ test("ledger v6 persists one canonical Delta/Gamma normal form and reconstructs 
 		assert.equal(complete?.stateId, resource.kind === "file" ? resource.currentVersionId : undefined);
 
 		const ledger = JSON.parse(readFileSync(join(stateDir, "ledger.json"), "utf8"));
-		assert.equal(ledger.schemaVersion, 6);
+		assert.equal(ledger.schemaVersion, 8);
 		assert.ok(Array.isArray(ledger.Delta));
 		assert.ok(Array.isArray(ledger.Gamma));
 		assert.ok(ledger.runtimeMetadata.effects);
@@ -528,17 +528,17 @@ test("steering rejects a non-ancestor and is consumed on delivery acknowledgment
 	} finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 
-test("path traversal and symlink escape are rejected", async () => {
+test("external paths require explicit authority after canonicalization", async () => {
 	const { workspace, manager, session } = await fixture();
 	const outside = mkdtempSync(join(tmpdir(), "linden-outside-"));
 	try {
 		writeFileSync(join(outside, "secret.txt"), "secret");
 		symlinkSync(join(outside, "secret.txt"), join(workspace, "link.txt"));
-		await assert.rejects(manager.readFile(session, "link.txt"), /PATH_OUTSIDE_BASE/);
-		await assert.rejects(manager.writeFile(session, join(outside, "escape.txt"), "bad"), /PATH_OUTSIDE_BASE/);
+		await assert.rejects(manager.readFile(session, "link.txt"), /UNAUTHORIZED_READ/);
+		await assert.rejects(manager.writeFile(session, join(outside, "escape.txt"), "bad"), /UNAUTHORIZED_WRITE/);
 		await assert.rejects(manager.readFile(session, "."), /NOT_A_FILE/);
 		assert.equal((await manager.readFile(session, "./note.txt")).state, "Absent");
-		await assert.rejects(manager.readFile(session, "~/note.txt"), /PATH_(?:OUTSIDE_BASE|CANONICALIZATION_FAILED)/);
+		await assert.rejects(manager.readFile(session, "~/note.txt"), /UNAUTHORIZED_READ|PATH_CANONICALIZATION_FAILED/);
 	} finally { rmSync(workspace, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
 });
 

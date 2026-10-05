@@ -3,10 +3,32 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
-import lindenExtension from "../src/pi/extension.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
+import { parseHumanSpawn } from "../src/pi/compat.js";
+import lindenExtension, { parseHumanSpawn as legacyParseHumanSpawn, type ParsedHumanSpawn as LegacyParsedHumanSpawn } from "../src/pi/extension.js";
 import { MAIL_BATCH, PiCoordinator, type MailPayload } from "../src/pi/runtime.js";
 import { buildTools } from "../src/pi/tools.js";
+
+test("the explicit Human spawn compatibility parser preserves legacy exports and syntax", () => {
+	assert.equal(legacyParseHumanSpawn, parseHumanSpawn);
+	const empty: LegacyParsedHumanSpawn = parseHumanSpawn([]);
+	assert.deepEqual(empty, { kind: "agent", name: undefined, prompt: undefined, grants: [], inheritWorkspaceRead: true });
+	for (const flag of ["--no-inherit-read", "--no-cwd-read", "--no-workspace-read"]) {
+		assert.equal(parseHumanSpawn([flag, "worker"]).inheritWorkspaceRead, false);
+	}
+	assert.deepEqual(parseHumanSpawn(["--kind", "term", "shell", "--give", "net:tcp/dns/example.com:443", "--give", "&file:./", "--", "echo", "--literal"]), {
+		kind: "term", name: "shell", prompt: "echo --literal", grants: ["net:tcp/dns/example.com:443", "&file:./"], inheritWorkspaceRead: true,
+	});
+	assert.deepEqual(parseHumanSpawn(["worker", "inspect", "--kind", "term"]), {
+		kind: "agent", name: "worker", prompt: "inspect --kind term", grants: [], inheritWorkspaceRead: true,
+	});
+	assert.equal(parseHumanSpawn(["worker", "--", "  "]).prompt, undefined);
+	assert.throws(() => parseHumanSpawn(["--kind"]), /agent or term/);
+	assert.throws(() => parseHumanSpawn(["--kind", "human"]), /agent or term/);
+	assert.throws(() => parseHumanSpawn(["--give"]), /Missing resource/);
+	assert.throws(() => parseHumanSpawn(["--unknown"]), /Unknown spawn option/);
+	assert.throws(() => parseHumanSpawn(["worker", "extra", "--", "prompt"]), /only one optional name/);
+});
 
 test("Pi extension overrides every native gateway and registers collaboration tools", () => {
 	const tools: string[] = [];
@@ -20,9 +42,10 @@ test("Pi extension overrides every native gateway and registers collaboration to
 		on(name: string) { events.push(name); },
 	};
 	lindenExtension(fake);
-	assert.deepEqual(tools.sort(), ["participants", "archive", "authority", "bash", "checkout", "edit", "exec", "get", "give", "input", "interrupt", "listen", "log", "read", "receive", "rewind", "send", "spawn", "stat", "steer", "stop", "wait", "write"].sort());
-	assert.ok(commands.includes("linden"));
-	assert.ok(flags.includes("linden-web"));
+	assert.deepEqual(tools.sort(), ["branch", "switch", "unarchive", "fork", "permission", "publish", "unpublish", "participants", "archive", "authority", "bash", "checkout", "edit", "exec", "get", "give", "input", "interrupt", "listen", "log", "read", "receive", "rewind", "send", "spawn", "stat", "steer", "stop", "wait", "write"].sort());
+	assert.equal(commands.includes("linden"), false);
+	assert.ok(events.includes("input"));
+	assert.ok(flags.includes("linden-permissions"));
 	assert.ok(flags.includes("linden-max-agent-depth"));
 	assert.ok(events.includes("user_bash"));
 	assert.ok(events.includes("session_start"));
@@ -63,66 +86,6 @@ test("Pi extension startup leaves persisted child runtimes lazy", async () => {
 	}
 });
 
-test("human spawn reports prompt degradation without fabricating an Agent checkpoint", async () => {
-	const handlers = new Map<string, (...args: any[]) => unknown>();
-	let lindenCommand: ((args: string, context: any) => Promise<void>) | undefined;
-	const fake: any = {
-		registerTool() {},
-		registerCommand(name: string, definition: any) { if (name === "linden") lindenCommand = definition.handler; },
-		registerFlag() {},
-		on(name: string, handler: (...args: any[]) => unknown) { handlers.set(name, handler); },
-		getFlag() { return ""; },
-		getActiveTools() { return []; },
-	};
-	const notices: Array<{ text: string; level: string }> = [];
-	const context: any = {
-		ui: {
-			notify(text: string, level: string) { notices.push({ text, level }); },
-			setStatus() {},
-			theme: { fg: (_color: string, value: string) => value },
-		},
-	};
-	let checkpointCalls = 0;
-	const active: any = {
-		authority: { rootParticipantId: "human:test", sessionParticipantId: "agent:root" },
-		setToolFactory() {},
-		setContext() {},
-		async activateSessionMailbox() {},
-		async spawnParticipant(_caller: string, options: unknown) { assert.deepEqual(options, { kind: "agent", name: "worker", prompt: "synthetic prompt", resources: [], inheritRead: true }); return "agent:committed-child"; },
-		spawnOutcome() {
-			return {
-				participantId: "agent:committed-child",
-				promptRequested: true,
-				promptAccepted: false,
-				turnPending: false,
-				warningsComplete: true,
-				warnings: [{
-					code: "LINDEN_INITIAL_PROMPT_REJECTED",
-					message: "The participant was created, but Pi rejected its initial prompt before starting a model turn.",
-					detail: "Error: no API key",
-				}],
-			};
-		},
-		async appendCheckpointAfterCommit() { checkpointCalls += 1; return undefined; },
-	};
-	const originalCreate = PiCoordinator.create;
-	(PiCoordinator as any).create = async () => active;
-	try {
-		lindenExtension(fake);
-		await handlers.get("session_start")?.({}, context);
-		assert.ok(lindenCommand);
-		await lindenCommand("spawn worker -- synthetic prompt", context);
-
-		assert.equal(checkpointCalls, 0);
-		assert.equal(notices.length, 1);
-		assert.match(notices[0].text, /Spawned agent agent:committed-child/);
-		assert.match(notices[0].text, /LINDEN_INITIAL_PROMPT_REJECTED/);
-		assert.match(notices[0].text, /Error: no API key/);
-		assert.doesNotMatch(notices[0].text, /LINDEN_POST_COMMIT_CHECKPOINT_FAILED/);
-	} finally {
-		(PiCoordinator as any).create = originalCreate;
-	}
-});
 
 test("participant tools prefer participant targets, accept the agent alias, and dispatch Term controls", async () => {
 	const calls: unknown[][] = [];
@@ -150,6 +113,10 @@ test("participant tools prefer participant targets, accept the agent alias, and 
 	};
 	await (tool("spawn").execute as any)("spawn-call", { kind: "term", name: "shell", inheritRead: false }, undefined, undefined, {});
 	await (tool("spawn").execute as any)("agent-spawn-call", { prompt: "review" }, undefined, undefined, {});
+	await (tool("spawn").execute as any)("legacy-spawn-call", { kind: "term", inheritWorkspaceRead: false }, undefined, undefined, {});
+	await (tool("spawn").execute as any)("precedence-spawn-call", { kind: "term", inheritRead: true, inheritWorkspaceRead: false }, undefined, undefined, {});
+	assert.match(tool("spawn").description, /net:tcp\/dns\/example\.com:443/);
+	assert.doesNotMatch(tool("spawn").description, /web:/);
 	await (tool("listen").execute as any)("listen-call", { agent: "term:one" }, undefined, undefined, {});
 	const logged = await (tool("log").execute as any)("log-call", { target: "term:one" }, undefined, undefined, {});
 	assert.equal(logged.content[0]?.text, "term epoch history");
@@ -162,6 +129,8 @@ test("participant tools prefer participant targets, accept the agent alias, and 
 	assert.deepEqual(calls, [
 		["spawn", "agent:caller", { kind: "term", name: "shell", prompt: undefined, resources: [], inheritRead: false, cwd: process.cwd(), origin: "model" }],
 		["spawn", "agent:caller", { kind: "agent", name: undefined, prompt: "review", resources: [], inheritRead: true, cwd: process.cwd(), origin: "model" }],
+		["spawn", "agent:caller", { kind: "term", name: undefined, prompt: undefined, resources: [], inheritRead: false, cwd: process.cwd(), origin: "model" }],
+		["spawn", "agent:caller", { kind: "term", name: undefined, prompt: undefined, resources: [], inheritRead: true, cwd: process.cwd(), origin: "model" }],
 		["listen", "agent:caller", "term:one", { after: undefined, wait: undefined, signal: undefined }],
 		["log", "agent:caller", "term:one"],
 		["wait", "agent:caller", "term:one", "stopped"],
@@ -172,6 +141,30 @@ test("participant tools prefer participant targets, accept the agent alias, and 
 		["archive", "agent:caller", "term:one"],
 	]);
 	await assert.rejects((tool("listen").execute as any)("bad", { participant: "term:one", agent: "agent:other" }, undefined, undefined, {}), /same target/);
+});
+
+test("give keeps the legacy grant mode while describing File/Net use projections", async () => {
+	const calls: unknown[][] = [];
+	const coordinator: any = {
+		authority: { workspace: process.cwd() },
+		beginTool() {}, endTool() {},
+		async give(caller: string, target: string, resource: string, cwd: string) {
+			calls.push([caller, target, resource, cwd]);
+			return { mode: "read", targetId: target, moved: [resource.slice(1)] };
+		},
+		async appendCheckpointAfterCommit() { return {}; },
+	};
+	const give = buildTools(coordinator, "agent:caller").find((tool) => tool.name === "give")!;
+	assert.match(give.description, /use projection \(File read, Net connect\)/);
+	for (const resource of ["&file:./", "&net:tcp/dns/example.com:443"]) {
+		const result = await (give.execute as any)("give-call", { participant: "agent:child", resource }, undefined, undefined, {});
+		assert.equal(result.content[0].text, `Granted use projection on ${resource.slice(1)} to agent:child`);
+		assert.deepEqual(result.details, { mode: "read", targetId: "agent:child", moved: [resource.slice(1)] });
+	}
+	assert.deepEqual(calls, [
+		["agent:caller", "agent:child", "&file:./", process.cwd()],
+		["agent:caller", "agent:child", "&net:tcp/dns/example.com:443", process.cwd()],
+	]);
 });
 
 test("Fixed Agent tools advertise and dispatch only Term spawn", async () => {
@@ -187,8 +180,10 @@ test("Fixed Agent tools advertise and dispatch only Term spawn", async () => {
 	const spawn = buildTools(coordinator, "agent:fixed").find((tool) => tool.name === "spawn");
 	assert.ok(spawn);
 	const properties = (spawn.parameters as any).properties;
-	assert.deepEqual(Object.keys(properties).sort(), ["inheritRead", "inheritWorkspaceRead", "kind", "name", "resources"]);
+	assert.deepEqual(Object.keys(properties).sort(), ["inheritRead", "inheritWorkspaceRead", "kind", "name", "resources", "rootDir"]);
 	assert.equal(properties.kind.anyOf?.[0]?.const ?? properties.kind.const, "term");
+	assert.match(spawn.description, /net:tcp\/dns\/example\.com:443/);
+	assert.doesNotMatch(spawn.description, /web:/);
 	await (spawn.execute as any)("spawn-fixed", {}, undefined, undefined, {});
 	assert.deepEqual(calls, [["agent:fixed", {
 		kind: "term", name: undefined, resources: [], inheritRead: true, cwd: process.cwd(), origin: "model",
@@ -201,7 +196,7 @@ test("Linden read and Bash tool results retain Pi's bounded output contract", as
 	const coordinator: any = {
 		authority: {
 			workspace: process.cwd(),
-			async readFile() { return { state: "Present", path: "/fixture", resourceId: "file:/fixture", content: readContent }; },
+			async readFileBytes() { return { state: "Present", path: "/fixture", resourceId: "file:/fixture", content: Buffer.from(readContent) }; },
 			async bash() { return { output: bashContent, exitCode: 0, changedResources: [], notices: [] }; },
 		},
 		isAgentSpawnEnabled: () => true,
@@ -234,7 +229,7 @@ test("Pi tools resolve relative files, Bash, transfers, and children from the se
 			authority: {
 				...manager,
 				workspace: base,
-				readFile: manager.readFile.bind(manager),
+				readFileBytes: manager.readFileBytes.bind(manager),
 				bash: async (...args: unknown[]) => { bashCalls.push(args); return { output: "ok", exitCode: 0, changedResources: [], notices: [] }; },
 			},
 			runtimes: new Map(),
@@ -262,119 +257,24 @@ test("Pi tools resolve relative files, Bash, transfers, and children from the se
 	}
 });
 
-test("human /linden exposes common participant and Term controls", async () => {
-	const handlers = new Map<string, (...args: any[]) => unknown>();
-	let lindenCommand: ((args: string, context: any) => Promise<void>) | undefined;
-	const fake: any = {
-		registerTool() {},
-		registerCommand(name: string, definition: any) { if (name === "linden") lindenCommand = definition.handler; },
-		registerFlag() {},
-		on(name: string, handler: (...args: any[]) => unknown) { handlers.set(name, handler); },
-		getFlag() { return ""; },
-		getActiveTools() { return []; },
-	};
-	const notices: Array<{ text: string; level: string }> = [];
-	const navigations: Array<{ entryId: string; options: unknown }> = [];
-	const context: any = {
-		ui: {
-			notify(text: string, level: string) { notices.push({ text, level }); },
-			setStatus() {},
-			theme: { fg: (_color: string, value: string) => value },
-		},
-		async navigateTree(entryId: string, options: unknown) { navigations.push({ entryId, options }); return { cancelled: false }; },
-	};
-	const calls: unknown[][] = [];
-	const active: any = {
-		authority: {
-			rootParticipantId: "human:test",
-			sessionParticipantId: "agent:root",
-			resource(resourceId: string) { return resourceId === "file:owned" ? { ownerId: "agent:child" } : undefined; },
-			get() { throw new Error("authority.get must not be called by /linden get"); },
-		},
-		setToolFactory() {},
-		setContext() {},
-		async activateSessionMailbox() {},
-		async appendCheckpoint() {},
-		async appendCheckpointAfterCommit() { return {}; },
-		resolveParticipantRef(reference: string) { calls.push(["resolve-participant", reference]); return reference; },
-		async resolveOwnedResource(...args: unknown[]) { calls.push(["resolve-owned", ...args]); return "file:owned"; },
-		async resolveOwnedChildResource(...args: unknown[]) {
-			calls.push(["resolve-owned-child", ...args]);
-			return { targetId: args[1], resourceId: "file:owned" };
-		},
-		async getOwnedResource(...args: unknown[]) { calls.push(["get-owned", ...args]); return ["file:owned"]; },
-		async send(...args: unknown[]) { calls.push(["send", ...args]); return "message:send"; },
-		async steer(...args: unknown[]) { calls.push(["steer", ...args]); return "message:steer"; },
-		async listenParticipant(...args: unknown[]) { calls.push(["listen", ...args]); return "term:one ready"; },
-		async formatParticipantLog(...args: unknown[]) { calls.push(["log", ...args]); return "term epoch history"; },
-		async waitParticipant(...args: unknown[]) { calls.push(["wait", ...args]); return { status: "reached", state: args[2] }; },
-		async interrupt(...args: unknown[]) { calls.push(["interrupt", ...args]); },
-		async stop(...args: unknown[]) { calls.push(["stop", ...args]); },
-		async archive(...args: unknown[]) { calls.push(["archive", ...args]); },
-		async termExec(...args: unknown[]) { calls.push(["exec", ...args]); },
-		async termInput(...args: unknown[]) { calls.push(["input", ...args]); },
-		async rewind(...args: unknown[]) { calls.push(["rewind", ...args]); },
-		async discoverParticipantTree(...args: unknown[]) { calls.push(["participants", ...args]); return "participant tree"; },
-	};
-	const originalCreate = PiCoordinator.create;
-	(PiCoordinator as any).create = async () => active;
+test("attached colon commands inspect the current Agent and expose no implicit Human controls", async () => {
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const commands: string[] = [];
+	const fake: any = { registerTool() {}, registerCommand(name: string) { commands.push(name); }, registerFlag() {}, on(name: string, handler: any) { handlers.set(name, handler); }, getFlag() { return ""; } };
+	const notices: string[] = [];
+	const viewers: string[] = [];
+	const context: any = { ui: { notify(text: string) { notices.push(text); }, setStatus() {}, theme: { fg: (_: string, text: string) => text } } };
+	const original = PiCoordinator.create;
+	(PiCoordinator as any).create = async () => ({ authority: { sessionParticipantId: "agent:attached", rootParticipantId: "human:root" }, setToolFactory() {}, setContext() {}, async activateSessionMailbox() {}, describeAuthority(viewer: string) { viewers.push(viewer); return "Agent authority"; } });
 	try {
 		lindenExtension(fake);
-		await handlers.get("session_start")?.({}, context);
-		assert.ok(lindenCommand);
-		await lindenCommand("listen term:one", context);
-		await lindenCommand("log term:one", context);
-		await lindenCommand("wait term:one stopped", context);
-		await lindenCommand("interrupt term:one", context);
-		await lindenCommand("stop term:one", context);
-		await lindenCommand(`exec term:one printf '%s  x' "$HOME"  `, context);
-		await lindenCommand(`input term:one  yes\\n  `, context);
-		await lindenCommand("inputln term:one", context);
-		await lindenCommand(`send agent:child Keep  "quoted" \\tail`, context);
-		await lindenCommand(`steer agent:child Change  course`, context);
-		await lindenCommand("rewind agent:child agent-state:one", context);
-		await lindenCommand("get agent:child file:./owned.txt", context);
-		await lindenCommand("archive term:one", context);
-		await lindenCommand("participants", context);
-		assert.deepEqual(calls, [
-			["listen", "human:test", "term:one"],
-			["log", "human:test", "term:one"],
-			["wait", "human:test", "term:one", "stopped"],
-			["interrupt", "human:test", "term:one"],
-			["stop", "human:test", "term:one"],
-			["exec", "human:test", "term:one", `printf '%s  x' "$HOME"  `],
-			["input", "human:test", "term:one", ` yes\\n  `],
-			["input", "human:test", "term:one", "\n"],
-			["send", "human:test", "agent:child", `Keep  "quoted" \\tail`],
-			["steer", "human:test", "agent:child", "Change  course"],
-			["rewind", "human:test", "agent:child", "agent-state:one"],
-			["resolve-owned-child", "human:test", "agent:child", "file:./owned.txt"],
-			["get-owned", "human:test", "agent:child", "file:owned"],
-			["archive", "human:test", "term:one"],
-			["participants", "human:test"],
-		]);
-		await lindenCommand("rewind agent-state:root", context);
-		const rootRewind = calls.pop();
-		assert.deepEqual(rootRewind?.slice(0, 4), ["rewind", "human:test", "agent:root", "agent-state:root"]);
-		const navigateRoot = rootRewind?.[4];
-		assert.equal(typeof navigateRoot, "function", "root rewind uses the same coordinator lifecycle and only injects its Pi navigator");
-		await (navigateRoot as unknown as (entryId: string) => Promise<void>)("pi:root-target");
-		assert.deepEqual(navigations, [{ entryId: "pi:root-target", options: { summarize: false } }]);
-		assert.equal(notices.filter((notice) => notice.level === "error").length, 0);
-		await lindenCommand("participants all", context);
-		assert.match(notices.at(-1)?.text ?? "", /Usage: \/linden participants/);
-		await lindenCommand("subpath file:. nested read", context);
-		assert.match(notices.at(-1)?.text ?? "", /Unknown \/linden action subpath/);
-		await lindenCommand("file file:. nested read", context);
-		assert.match(notices.at(-1)?.text ?? "", /Unknown \/linden action file/);
-		await lindenCommand("unarchive term:one", context);
-		assert.match(notices.at(-1)?.text ?? "", /Unknown \/linden action unarchive/);
-		await lindenCommand('show "unterminated', context);
-		assert.match(notices.at(-1)?.text ?? "", /Unterminated/);
-		assert.equal(notices.at(-1)?.level, "error", "Human command parse errors stay inside the UI error boundary");
-	} finally {
-		(PiCoordinator as any).create = originalCreate;
-	}
+		await handlers.get("session_start")!({}, context);
+		assert.deepEqual(await handlers.get("input")!({ text: ":authority" }, context), { action: "handled" });
+		assert.deepEqual(viewers, ["agent:attached"]);
+		await handlers.get("input")!({ text: ":spawn worker" }, context);
+		assert.match(notices.at(-1)!, /Human workspace commands belong to linden CLI/);
+		assert.deepEqual(commands, []);
+	} finally { (PiCoordinator as any).create = original; }
 });
 
 test("every Linden tool checks the interrupt gate before starting", async () => {
@@ -459,7 +359,7 @@ test("parent-to-child tools resolve a unique Pi session suffix before authority 
 		const listened = await coordinator.listen(parent, suffix);
 		assert.match(listened, new RegExp(child));
 		assert.match(listened, /kind=Agent lifecycle=stopped/);
-		assert.equal(await coordinator.formatAgentLog(parent, suffix), "No Pi entries.");
+		assert.match(await coordinator.formatAgentLog(parent, suffix), /Current branch: main[\s\S]*No Pi entries\./);
 		const messageId = await coordinator.send(parent, suffix, "hello");
 		assert.equal(manager.pendingMessages(child)[0]?.id, messageId);
 		const exact = await manager.file(parent, manager.baseResourceId(), "delegated.txt", "write");

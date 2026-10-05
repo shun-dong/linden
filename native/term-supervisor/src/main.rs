@@ -117,6 +117,7 @@ struct Supervisor {
     supervisor_pgrp: libc::pid_t,
     current: Option<ActiveCommand>,
     buffer: Vec<u8>,
+    publications: HashMap<String, Child>,
 }
 
 impl Supervisor {
@@ -145,6 +146,7 @@ impl Supervisor {
             supervisor_pgrp: unsafe { libc::getpgrp() },
             current: None,
             buffer: Vec::new(),
+            publications: HashMap::new(),
         })
     }
 
@@ -217,10 +219,36 @@ impl Supervisor {
         }
         match object.get("type").and_then(Value::as_str) {
             Some("exec") => self.start_command(object),
+            Some("publish") => self.publish(object),
+            Some("unpublish") => self.unpublish(object),
             Some("interrupt") => self.interrupt(object, libc::SIGINT),
             Some("kill") => self.kill(object),
             _ => fail("unknown control record"),
         }
+    }
+
+    fn publish(&mut self, record: &Map<String, Value>) -> AnyResult<()> {
+        let id = required_string(record, "id")?.to_owned();
+        let socket = required_string(record, "socket")?;
+        let port = record.get("port").and_then(Value::as_u64).filter(|port| *port > 0 && *port <= 65535)
+            .ok_or_else(|| MessageError("invalid publication port".into()))?;
+        if self.publications.contains_key(&id) || !socket.starts_with("/tmp/linden-term-expose-") || !socket.ends_with(".sock") || socket.contains("/../") {
+            return fail("invalid publication");
+        }
+        let child = Command::new(env::current_exe()?).args(["loopback-monitor", &port.to_string(), socket])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn()?;
+        let pid = child.id();
+        self.publications.insert(id.clone(), child);
+        self.emit(json!({"type": "published", "id": id, "pid": pid}))
+    }
+
+    fn unpublish(&mut self, record: &Map<String, Value>) -> AnyResult<()> {
+        let id = required_string(record, "id")?.to_owned();
+        if let Some(mut child) = self.publications.remove(&id) {
+            unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL); }
+            let _ = child.wait();
+        }
+        self.emit(json!({"type": "unpublished", "id": id}))
     }
 
     fn start_command(&mut self, record: &Map<String, Value>) -> AnyResult<()> {

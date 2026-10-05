@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +11,18 @@ import { parseHumanSpawn } from "../src/pi/extension.js";
 import { parseParticipantPayloadCommand } from "../src/pi/human-command.js";
 import { formatParticipants } from "../src/pi/participants.js";
 import { PiCoordinator, type MailPayload } from "../src/pi/runtime.js";
+
+test("global CLI symlink starts Linden from another directory", () => {
+	const directory = mkdtempSync(join(tmpdir(), "linden-global-cli-"));
+	try {
+		const entry = join(directory, "linden");
+		symlinkSync(fileURLToPath(new URL("../src/cli.js", import.meta.url)), entry);
+		const result = spawnSync(process.execPath, [entry, "--help"], { cwd: directory, encoding: "utf8" });
+		assert.equal(result.status, 0, result.stderr);
+		assert.match(result.stdout, /Linden control plane/);
+		assert.match(result.stdout, /Usage: linden/);
+	} finally { rmSync(directory, { recursive: true, force: true }); }
+});
 
 test("control-plane parsing keeps shell commands isolated and parses explicit spawn grants", () => {
 	assert.match(LINDEN_CLI_HELP, /:log <resource-or-participant>/);
@@ -42,8 +56,8 @@ test("control-plane parsing keeps shell commands isolated and parses explicit sp
 		grants: ["file:./"],
 		inheritWorkspaceRead: true,
 	});
-	assert.equal(parseCliOptions(["--session", "deadbeef"])?.session, "deadbeef");
-	assert.equal(parseCliOptions([".", "--session", "deadbeef"])?.base, realpathSync.native(process.cwd()));
+	assert.equal(parseCliOptions(["--workspace", "deadbeef"])?.session, "deadbeef");
+	assert.equal(parseCliOptions([".", "--workspace", "deadbeef"])?.base, realpathSync.native(process.cwd()));
 	assert.equal(parseCliOptions(["--max-agent-depth", "3"])?.maxAgentDepth, 3);
 	assert.throws(() => parseCliOptions(["--max-agent-depth", "0"]), /positive integer/);
 	assert.throws(() => parseCliOptions(["--max-agent-depth", "1.5"]), /positive integer/);
@@ -84,13 +98,13 @@ test("participants uses one human-inclusive tree format with relative relationsh
 		await manager.spawnWith(human, parent, "src", [], async () => ({ piSessionId: "parent-session" }));
 		await manager.spawnWith(parent, child, "ui", [], async () => ({ piSessionId: "child-session" }));
 		const fromHuman = formatParticipants(manager.snapshot(), human);
-		assert.match(fromHuman, new RegExp(`${human.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\) \\[self\\]`));
-		assert.match(fromHuman, /src\(agent:parent-session\) \[child\]/);
-		assert.match(fromHuman, /ui\(agent:child-session\) \[descendant\]/);
+		assert.match(fromHuman, new RegExp(`${human.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\) \\| self \\|`));
+		assert.match(fromHuman, /src\(agent:parent-session\) \| child \|/);
+		assert.match(fromHuman, /ui\(agent:child-session\) \| descendant \|/);
 		const fromParent = formatParticipants(manager.snapshot(), parent);
-		assert.match(fromParent, /\[parent\]/);
-		assert.match(fromParent, /src\(agent:parent-session\) \[self\]/);
-		assert.match(fromParent, /ui\(agent:child-session\) \[child\]/);
+		assert.match(fromParent, /\| parent \|/);
+		assert.match(fromParent, /src\(agent:parent-session\) \| self \|/);
+		assert.match(fromParent, /ui\(agent:child-session\) \| child \|/);
 	} finally {
 		rmSync(workspace, { recursive: true, force: true });
 	}

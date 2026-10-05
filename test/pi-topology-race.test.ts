@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { PiCoordinator, TermParticipantRuntime, type ParticipantRuntime } from "../src/pi/runtime.js";
+import { HostedParticipantRuntime, PiCoordinator, TermParticipantRuntime, type ParticipantRuntime } from "../src/pi/runtime.js";
 import { SessionAuthorityManager } from "../src/runtime/manager.js";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -268,6 +268,152 @@ test("lazy Term creation is single-flight and cannot publish after archive", asy
 	} finally {
 		releaseFactory.resolve();
 		await coordinator?.dispose().catch(() => undefined);
+		rmSync(workspace, { recursive: true, force: true });
+	}
+});
+
+test("spawn and restore prepare one Agent subscription before publication and route lifecycle events", async () => {
+	const workspace = mkdtempSync(join(tmpdir(), "linden-agent-factory-subscriptions-"));
+	let coordinator: PiCoordinator | undefined;
+	let disposals = 0;
+	try {
+		const manager = await SessionAuthorityManager.open({ workspace, rootParticipantId: "human:test", stateDir: join(workspace, ".linden-test") });
+		coordinator = PiCoordinator.createStandalone(manager);
+		coordinator.setToolFactory(() => []);
+		const subscriptions = new Map<string, (event: any) => void>();
+		const prepared: Array<[string, boolean]> = [];
+		const events: unknown[][] = [];
+		const internals = coordinator as any;
+		internals.handleRuntimeMessage = async (...args: unknown[]) => { events.push(["message", ...args]); };
+		internals.handleAgentStart = async (...args: unknown[]) => { events.push(["start", ...args]); };
+		internals.handleAgentEnd = async (...args: unknown[]) => { events.push(["end", ...args]); };
+		coordinator.setHostedRuntimeFactory(async (id, sessionManager) => ({
+			session: {
+				sessionId: sessionManager.getSessionId(), sessionFile: sessionManager.getSessionFile(), sessionManager,
+				isStreaming: false,
+				subscribe(listener: (event: any) => void) {
+					assert.equal(coordinator!.runtimes.has(id), false, "subscription precedes adapter publication");
+					assert.equal(subscriptions.has(id), false, "each prepared Agent is subscribed once");
+					prepared.push([id, Boolean(manager.participant(id))]);
+					subscriptions.set(id, listener);
+					return () => undefined;
+				},
+			},
+			async dispose() { disposals += 1; },
+		} as any));
+		const spawned = await coordinator.spawn(manager.rootParticipantId, "spawned", undefined, [], false);
+		const persisted = internals.createPersistedSessionManager(join(manager.stateDir, "pi-sessions"), undefined);
+		const restored = `agent:${persisted.getSessionId()}`;
+		await manager.spawnWith(manager.rootParticipantId, restored, "restored", [], async () => ({
+			piSessionId: persisted.getSessionId(), sessionFile: persisted.getSessionFile(),
+		}), { inheritWorkspaceRead: false });
+		await coordinator.restoreParticipant(restored);
+		assert.deepEqual(prepared, [[spawned, false], [restored, true]], "spawn subscription stays inside authority.spawnWith; restore uses existing ledger state");
+		for (const id of [spawned, restored]) {
+			assert.ok(coordinator.runtimes.get(id) instanceof HostedParticipantRuntime);
+			const message = { role: "custom", customType: "test" };
+			const listener = subscriptions.get(id)!;
+			listener({ type: "message_start", message });
+			listener({ type: "agent_start" });
+			listener({ type: "agent_end", willRetry: true });
+			await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+			assert.deepEqual(events.splice(0), [["message", id, message], ["start", id], ["end", id, true]]);
+		}
+		await coordinator.dispose();
+		assert.equal(disposals, 2);
+	} finally {
+		await coordinator?.dispose();
+		rmSync(workspace, { recursive: true, force: true });
+	}
+});
+
+for (const failure of ["subscription", "metadata"] as const) {
+	test(`Agent factory ${failure} failure rolls back spawn and awaits cleanup without masking the error`, async () => {
+		const workspace = mkdtempSync(join(tmpdir(), "linden-agent-factory-rollback-"));
+		let coordinator: PiCoordinator | undefined;
+		let child: string | undefined;
+		let subscriptions = 0;
+		let disposals = 0;
+		try {
+			const manager = await SessionAuthorityManager.open({ workspace, rootParticipantId: "human:test", stateDir: join(workspace, ".linden-test") });
+			const before = manager.snapshot();
+			coordinator = PiCoordinator.createStandalone(manager);
+			coordinator.setToolFactory(() => []);
+			coordinator.setHostedRuntimeFactory(async (id, sessionManager) => {
+				child = id;
+				return {
+					session: {
+						sessionId: failure === "metadata" ? "" : sessionManager.getSessionId(),
+						sessionFile: sessionManager.getSessionFile(), sessionManager, isStreaming: false,
+						subscribe() {
+							subscriptions += 1;
+							assert.equal(manager.participant(id), undefined);
+							assert.equal(coordinator!.runtimes.has(id), false);
+							if (failure === "subscription") throw new Error("subscription setup failed");
+						},
+					},
+					async dispose() { await Promise.resolve(); disposals += 1; throw new Error("cleanup failure must not mask spawn failure"); },
+				} as any;
+			});
+			await assert.rejects(coordinator.spawn(manager.rootParticipantId, "rollback", undefined, [], false, workspace, false),
+				failure === "subscription" ? /subscription setup failed/ : /INVALID_PARTICIPANT_STATE: runtime metadata/);
+			assert.ok(child);
+			assert.deepEqual(manager.snapshot(), before);
+			assert.equal(coordinator.runtimes.has(child), false);
+			assert.equal((coordinator as any).agentSpawnDisabled.has(child), false);
+			assert.equal(subscriptions, 1);
+			assert.equal(disposals, 1, "rejection waits for prepared-host cleanup, even if cleanup itself fails");
+		} finally {
+			await coordinator?.dispose();
+			rmSync(workspace, { recursive: true, force: true });
+		}
+	});
+}
+
+test("restore subscription failure disposes once, clears session binding and permits a clean retry", async () => {
+	const workspace = mkdtempSync(join(tmpdir(), "linden-agent-restore-subscription-"));
+	let coordinator: PiCoordinator | undefined;
+	let disposals = 0;
+	try {
+		const manager = await SessionAuthorityManager.open({ workspace, rootParticipantId: "human:test", stateDir: join(workspace, ".linden-test") });
+		coordinator = PiCoordinator.createStandalone(manager);
+		coordinator.setToolFactory(() => []);
+		const internals = coordinator as any;
+		const persisted = internals.createPersistedSessionManager(join(manager.stateDir, "pi-sessions"), undefined);
+		const child = `agent:${persisted.getSessionId()}`;
+		await manager.spawnWith(manager.rootParticipantId, child, "retry restore", [], async () => ({
+			piSessionId: persisted.getSessionId(), sessionFile: persisted.getSessionFile(),
+		}), { inheritWorkspaceRead: false });
+		const before = manager.snapshot();
+		let rejectSubscription = true;
+		let subscriptions = 0;
+		coordinator.setHostedRuntimeFactory(async (id, sessionManager) => ({
+			session: {
+				sessionId: sessionManager.getSessionId(), sessionFile: sessionManager.getSessionFile(), sessionManager,
+				isStreaming: false,
+				subscribe() {
+					subscriptions += 1;
+					assert.equal(coordinator!.runtimes.has(id), false);
+					if (rejectSubscription) throw new Error("restore subscription failed");
+					return () => undefined;
+				},
+			},
+			async dispose() { await Promise.resolve(); disposals += 1; },
+		} as any));
+		await assert.rejects(coordinator.restoreParticipant(child), /restore subscription failed/);
+		assert.deepEqual(manager.snapshot(), before);
+		assert.equal(coordinator.runtimes.has(child), false);
+		assert.equal(internals.restoredSessionFiles.size, 0);
+		assert.equal(internals.participantRestores.size, 0);
+		assert.equal(disposals, 1);
+		rejectSubscription = false;
+		await coordinator.restoreParticipant(child);
+		assert.ok(coordinator.runtimes.get(child) instanceof HostedParticipantRuntime);
+		assert.equal(subscriptions, 2, "retry creates and subscribes a fresh adapter");
+		await coordinator.dispose();
+		assert.equal(disposals, 2, "the failed and successfully restored adapters are each disposed once");
+	} finally {
+		await coordinator?.dispose();
 		rmSync(workspace, { recursive: true, force: true });
 	}
 });

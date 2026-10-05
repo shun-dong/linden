@@ -2,18 +2,39 @@ import assert from "node:assert/strict";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { sandboxRequirements } from "./runtime-requirements.js";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
 import { DynamicSandbox } from "../src/runtime/sandbox.js";
 
-const hasBwrap = spawnSync("which", ["bwrap"], { stdio: "ignore" }).status === 0;
+const sandboxRuntime = await sandboxRequirements();
 
 async function moveWorkspaceTo(manager: SessionAuthorityManager, participantId: string): Promise<void> {
 	await manager.give(manager.rootParticipantId, participantId, manager.baseResourceId());
 }
 
-test("sandboxed Bash mutates only held Path authority and reconciles versions", { skip: !hasBwrap }, async () => {
+test("sandbox supplies a read-only synthetic identity and working system command links", { skip: sandboxRuntime.skip }, async () => {
+	const workspace = mkdtempSync(join(tmpdir(), "linden-system-compat-"));
+	try {
+		const manager = await SessionAuthorityManager.open({ workspace, stateDir: join(workspace, ".state"), rootParticipantId: "human:compat-test" });
+		const script = [
+			'const assert = require("node:assert/strict"), fs = require("node:fs"), os = require("node:os"), cp = require("node:child_process");',
+			'const user = os.userInfo(); assert.equal(user.username, "linden"); assert.equal(user.uid, 0); assert.equal(user.homedir, "/tmp/linden-home");',
+			'assert.equal(fs.readFileSync("/etc/group", "utf8"), "linden:x:0:\\n");',
+			'assert.throws(() => fs.writeFileSync("/etc/passwd", "tamper"), { code: "EROFS" });',
+			'assert.equal(fs.existsSync("/etc/hosts"), false);',
+			'const which = cp.spawnSync("which", ["bwrap"], { encoding: "utf8" }); assert.equal(which.status, 0, which.stderr); assert.match(which.stdout, /bwrap/);',
+			'const who = cp.spawnSync("whoami", [], { encoding: "utf8" }); assert.equal(who.status, 0); assert.equal(who.stdout.trim(), "linden");',
+			'console.log("system compatibility OK");',
+		].join(" ");
+		const result = await manager.bash(manager.rootParticipantId, `node -e '${script}'`);
+		assert.equal(result.exitCode, 0, result.output);
+		assert.match(result.output, /system compatibility OK/);
+		assert.equal(manager.rootParticipantId, "human:compat-test");
+	} finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("sandboxed Bash mutates only held Path authority and reconciles versions", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-bash-"));
 	const hostSentinel = join(tmpdir(), `linden-host-${process.pid}`);
 	writeFileSync(hostSentinel, "host");
@@ -27,7 +48,7 @@ test("sandboxed Bash mutates only held Path authority and reconciles versions", 
 	} finally { rmSync(workspace, { recursive: true, force: true }); rmSync(hostSentinel, { force: true }); }
 });
 
-test("Bash permits a hardlink group only when every alias stays inside write authority", { skip: !hasBwrap }, async () => {
+test("Bash permits a hardlink group only when every alias stays inside write authority", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-bash-hardlinks-"));
 	const outside = mkdtempSync(join(tmpdir(), "linden-bash-hardlinks-outside-"));
 	try {
@@ -54,7 +75,7 @@ test("Bash permits a hardlink group only when every alias stays inside write aut
 	}
 });
 
-test("an explicitly shared sandbox tmp remains typed and visible at its public source", { skip: !hasBwrap }, async () => {
+test("an explicitly shared sandbox tmp remains typed and visible at its public source", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-bash-shared-tmp-"));
 	const sharedTmp = join(workspace, "grader-visible-tmp");
 	try {
@@ -69,7 +90,7 @@ test("an explicitly shared sandbox tmp remains typed and visible at its public s
 	}
 });
 
-test("reads during a long Bash writer return the last committed snapshot without waiting", { skip: !hasBwrap }, async () => {
+test("reads during a long Bash writer return the last committed snapshot without waiting", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-bash-snapshot-read-"));
 	try {
 		const manager = await SessionAuthorityManager.open({ workspace, sessionId: "bash-snapshot-read", stateDir: join(workspace, ".linden-test") });
@@ -97,7 +118,7 @@ test("reads during a long Bash writer return the last committed snapshot without
 	}
 });
 
-test("delegated exact File is over-mounted read-only in former owner's broad Path sandbox", { skip: !hasBwrap }, async () => {
+test("delegated exact File is over-mounted read-only in former owner's broad Path sandbox", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-bash-transfer-"));
 	try {
 		const manager = await SessionAuthorityManager.open({ workspace, sessionId: "bash-transfer", stateDir: join(workspace, ".linden-test") });
@@ -113,7 +134,7 @@ test("delegated exact File is over-mounted read-only in former owner's broad Pat
 	} finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 
-test("owner Bash can rm a tracked exact File and the version tree returns to Absent", { skip: !hasBwrap }, async () => {
+test("owner Bash can rm a tracked exact File and the version tree returns to Absent", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-bash-rm-"));
 	try {
 		const manager = await SessionAuthorityManager.open({ workspace, sessionId: "bash-rm", stateDir: join(workspace, ".linden-test") });
@@ -136,7 +157,7 @@ test("owner Bash can rm a tracked exact File and the version tree returns to Abs
 	} finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 
-test("an exact-File placeholder reservation race preserves the external replacement", { skip: !hasBwrap }, async () => {
+test("an exact-File placeholder reservation race preserves the external replacement", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-bash-placeholder-race-"));
 	let sandbox: DynamicSandbox | undefined;
 	try {

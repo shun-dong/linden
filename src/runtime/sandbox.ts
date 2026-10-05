@@ -1,11 +1,15 @@
-import { spawn, spawnSync, type ChildProcess, type StdioOptions } from "node:child_process";
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readlinkSync, rmSync } from "node:fs";
-import { dirname, isAbsolute, join, parse } from "node:path";
+import { NetGuard } from "./net-guard.js";
+import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readlinkSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import type { EffectiveAuthority } from "./model.js";
 import { isInside, pathExpressionContains } from "./paths.js";
-import { DomainGuard, LoopbackExposureBridge, NetworkBridge } from "./network.js";
+import { NetworkBridge, type NetworkGuard } from "./network-bridge.js";
+import { DomainGuard, LoopbackExposureBridge } from "./compat/network.js";
 import type { BashPlaceholderIdentity, BashPlaceholderJournal } from "./store.js";
+import { BUBBLEWRAP_ISOLATION_ARGS, requireBubblewrap, requireRuntimeCommand } from "./capabilities.js";
 
 export interface SandboxRunOptions {
 	onData?: (data: Buffer) => void;
@@ -73,7 +77,6 @@ export function cleanupAbsentWritePlaceholders(records: BashPlaceholderJournal[]
 	}
 	return { removed, violations };
 }
-const commandExists = (command: string): boolean => spawnSync("which", [command], { stdio: "ignore" }).status === 0;
 const systemRuntimeRoots = ["/usr", "/bin", "/sbin", "/lib", "/lib64"];
 const systemRuntimeFiles = ["/etc/ld.so.cache", "/etc/ca-certificates.conf"];
 const certificateRoots = ["/etc/ssl", "/etc/pki"];
@@ -103,6 +106,8 @@ function ancestorDirs(path: string): string[] {
 }
 
 export class DynamicSandbox {
+	private bubblewrapPath?: string;
+	private identityDirectory?: string;
 	private bridge?: NetworkBridge;
 	private exposureBridge?: LoopbackExposureBridge;
 	private placeholders: BashPlaceholderJournal[] = [];
@@ -114,11 +119,13 @@ export class DynamicSandbox {
 		readonly loopbackPorts: readonly number[] = [],
 		readonly runtimeHelperExecutable?: string,
 		readonly sharedTmpPath?: string,
+		readonly netGuard?: NetworkGuard,
+		readonly onNetworkBridge?: (bridge: NetworkBridge) => void,
+		readonly publicationDirectory?: string,
 	) {}
 
 	async initialize(): Promise<void> {
-		if (process.platform !== "linux") throw new Error(`Linden bubblewrap sandbox requires Linux, got ${process.platform}`);
-		if (!commandExists("bwrap")) throw new Error("bubblewrap (bwrap) is required");
+		this.bubblewrapPath = await requireBubblewrap();
 		if (this.sharedTmpPath !== undefined) {
 			if (!isAbsolute(this.sharedTmpPath) || !existsSync(this.sharedTmpPath) || !lstatSync(this.sharedTmpPath).isDirectory()
 				|| this.privateRoots.some((root) => isInside(this.sharedTmpPath!, root))
@@ -131,20 +138,27 @@ export class DynamicSandbox {
 			throw new Error(`Bash denied: delegated non-existent paths cannot be excluded safely by bubblewrap (${this.authority.unsafeAbsentWriteExclusions.join(", ")})`);
 		}
 		this.prepareAbsentWritePlaceholders();
-		if (this.authority.webDomains.length) {
-			if (!commandExists("socat")) throw new Error("socat is required for domain-filtered Web authority");
-			this.bridge = new NetworkBridge(new DomainGuard(this.authority.webDomains));
+		if (this.authority.webDomains.length || this.authority.netEndpoints?.length || this.netGuard) {
+			await requireRuntimeCommand("socat", ["-V"]);
+			this.bridge = new NetworkBridge(this.netGuard ?? (this.authority.netEndpoints ? new NetGuard(() => ({ endpoints: this.authority.netEndpoints ?? [], exclusions: this.authority.netExclusions ?? [] })) : new DomainGuard(this.authority.webDomains)));
 			await this.bridge.start();
+			this.onNetworkBridge?.(this.bridge);
 		}
 		if (this.runtimeHelperExecutable !== undefined
 			&& (!this.runtimeHelperExecutable.startsWith("/") || !existsSync(this.runtimeHelperExecutable))) {
 			throw new Error("An absolute Linden runtime helper is required for Term");
 		}
 		if (this.loopbackPorts.length) {
-			if (!commandExists("socat")) throw new Error("socat is required for Term loopback exposure");
+			await requireRuntimeCommand("socat", ["-V"]);
 			if (!this.runtimeHelperExecutable) throw new Error("The Linden runtime helper is required for Term loopback exposure monitoring");
 			this.exposureBridge = new LoopbackExposureBridge(this.loopbackPorts);
 			await this.exposureBridge.start();
+		}
+		if (!this.identityDirectory) {
+			this.identityDirectory = mkdtempSync(join(tmpdir(), "linden-system-"));
+			// Compatibility identity only: it never defines a Linden participant or authority.
+			writeFileSync(join(this.identityDirectory, "passwd"), "linden:x:0:0:Linden sandbox:/tmp/linden-home:/bin/bash\n", { mode: 0o644 });
+			writeFileSync(join(this.identityDirectory, "group"), "linden:x:0:\n", { mode: 0o644 });
 		}
 	}
 
@@ -177,7 +191,11 @@ export class DynamicSandbox {
 	}
 
 	async shutdown(): Promise<void> {
-		await Promise.all([this.bridge?.stop(), this.exposureBridge?.stop()]);
+		try { await Promise.all([this.bridge?.stop(), this.exposureBridge?.stop()]); }
+		finally {
+			if (this.identityDirectory) rmSync(this.identityDirectory, { recursive: true, force: true });
+			this.identityDirectory = undefined;
+		}
 	}
 
 	operations(): BashOperations { return { exec: async (command, cwd, options) => this.exec(command, cwd, options) }; }
@@ -188,9 +206,10 @@ export class DynamicSandbox {
 	 * exit before cleanupPlaceholders().
 	 */
 	spawnProcess(command: string, cwd = this.cwd, options: SandboxSpawnOptions = {}): ChildProcess {
+		if (!this.bubblewrapPath || !this.identityDirectory) throw new Error("LINDEN_SANDBOX_NOT_INITIALIZED: initialize the sandbox before starting a process");
 		const args = this.arguments(command, cwd, options.controlSockets ?? []);
-		return spawn("bwrap", args, {
-			cwd,
+		return spawn(this.bubblewrapPath, args, {
+			cwd: "/",
 			detached: true,
 			stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
 			env: sandboxEnvironment(),
@@ -218,10 +237,9 @@ export class DynamicSandbox {
 	}
 
 	private arguments(command: string, cwd: string, controlSockets: string[] = []): string[] {
-		if (!this.authority.readExpressions.some((expression) => pathExpressionContains(expression, cwd))) throw new Error(`Bash cwd is not readable: ${cwd}`);
+		if (this.privateRoots.some((root) => isInside(cwd, root))) throw new Error("Bash cwd is private state");
 		const args = [
-			"--new-session", "--die-with-parent", "--unshare-user", "--uid", "0", "--gid", "0",
-			"--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net",
+			...BUBBLEWRAP_ISOLATION_ARGS,
 			// Bubblewrap starts with an empty root. Normally /tmp is private. An
 			// explicit evaluator path may instead be mounted there so an outer grader
 			// can observe declared Unix sockets or files while authority still tracks
@@ -267,6 +285,27 @@ export class DynamicSandbox {
 		};
 		for (const path of systemRuntimeRoots) exposeSystemRoot(path);
 		for (const path of [...systemRuntimeFiles, ...certificateRoots]) mount(path, false);
+		createDir("/etc");
+		for (const file of ["passwd", "group"]) args.push("--ro-bind", join(this.identityDirectory!, file), `/etc/${file}`);
+		// Debian's which traverses /etc/alternatives outside the mounted /usr.
+		// Recreate only this command's missing links, never the host /etc tree.
+		const repairedLinks = new Set<string>();
+		for (const candidate of ["/usr/bin/which", "/bin/which"]) {
+			if (!existsSync(candidate)) continue;
+			let path = join(realpathSync.native(dirname(candidate)), basename(candidate));
+			const visited = new Set<string>();
+			while (!visited.has(path) && lstatSync(path).isSymbolicLink()) {
+				visited.add(path);
+				const target = readlinkSync(path);
+				if (!repairedLinks.has(path) && !systemRuntimeRoots.some((root) => isInside(path, root))) {
+					createAncestors(path);
+					args.push("--symlink", target, path);
+					repairedLinks.add(path);
+				}
+				path = resolve(dirname(path), target);
+			}
+			if (![...visibleRoots].some((root) => isInside(path, root))) mount(path, false);
+		}
 		const runtimeRoot = dirname(dirname(process.execPath));
 		if (!systemRuntimeRoots.some((root) => isInside(process.execPath, root))) mount(runtimeRoot, false);
 		if (this.runtimeHelperExecutable
@@ -281,8 +320,8 @@ export class DynamicSandbox {
 			args.push("--bind", socket, socket);
 			visibleRoots.add(socket);
 		}
-		const exposureDirectory = this.exposureBridge?.directory;
-		if (exposureDirectory) {
+		const exposureDirectories = [...new Set([this.publicationDirectory, this.exposureBridge?.directory].filter((path): path is string => !!path))];
+		for (const exposureDirectory of exposureDirectories) {
 			if (!exposureDirectory.startsWith("/tmp/linden-term-expose-") || !existsSync(exposureDirectory) || !lstatSync(exposureDirectory).isDirectory()) {
 				throw new Error(`Invalid Term loopback exposure directory: ${exposureDirectory}`);
 			}
@@ -347,6 +386,8 @@ export class DynamicSandbox {
 		for (const path of readonlyOverlays) args.push("--remount-ro", path);
 		// Freeze the empty directory skeleton. Nested writable authority binds and
 		// the private /tmp mount remain writable because remount-ro is not recursive.
+		createAncestors(cwd);
+		if (!visibleRoots.has(cwd) && ![...visibleRoots].some((root) => isInside(cwd, root)) && !createdDirs.has(cwd)) createDir(cwd);
 		args.push("--remount-ro", "/");
 		args.push("--chdir", cwd, "--", "/bin/bash", "--noprofile", "--norc", "-c", wrapped);
 		return args;

@@ -115,7 +115,7 @@ config = file! root "config.json"
 });
 
 test("logical File resolution preserves a UNC share root", () => {
-	const base = "\\\\wsl.localhost\\Ubuntu\\home\\artifact\\linden\\repo";
+	const base = "\\\\wsl.localhost\\Ubuntu\\home\\kaelvio\\linden\\repo";
 	assert.equal(resolveLogicalPath(base, "src/deeper"), `${base}\\src\\deeper`);
 	assert.equal(resolveLogicalPath(base, "../../../../../../escape"), "\\\\wsl.localhost\\Ubuntu\\escape");
 });

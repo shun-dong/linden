@@ -1,5 +1,8 @@
+import { legacyAgentBranches, validateAgentBranches } from "./agent-history.js";
+import { netReference } from "./net.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
+	appendFileSync,
 	closeSync,
 	existsSync,
 	fsyncSync,
@@ -12,7 +15,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type {
 	AgentStateNode,
@@ -31,15 +34,16 @@ import type {
 	VersionNode,
 } from "./model.js";
 import { canonicalBase, canonicalCandidate, fileResourceId, isInside, parseFileResourceReference } from "./paths.js";
-import { resolveWebResourceReference } from "./network.js";
+import { resolveWebResourceReference } from "./compat/network.js";
+import { assertWellFormedContexts } from "../compiler/judgment.js";
 import { normalizeMaxAgentDepth } from "./agent-depth.js";
 
 const ABSENT_HASH = createHash("sha256").update("linden:absent:v1").digest("hex");
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const SNAPSHOT_FIELDS = new Set(["exists", "hash", "blobHash", "mode", "size"]);
-const PARTICIPANT_FIELDS = new Set(["name", "kind", "piSessionId", "sessionFile", "status", "createdAt"]);
-const FILE_OPERATIONS = new Set(["initial", "write", "edit", "bash", "term", "recovery"]);
-const EFFECT_KINDS = new Set(["participants", "spawn", "subpath", "file", "send", "steer", "wait", "interrupt", "stop", "receive", "give", "get", "write", "edit", "bash", "exec", "input", "checkout", "rewind", "archive"]);
+const PARTICIPANT_FIELDS = new Set(["name", "kind", "piSessionId", "sessionFile", "status", "createdAt", "rootDir", "permissionMode"]);
+const FILE_OPERATIONS = new Set(["initial", "write", "edit", "bash", "term", "recovery", "save"]);
+const EFFECT_KINDS = new Set(["participants", "spawn", "subpath", "file", "send", "steer", "wait", "interrupt", "stop", "receive", "give", "get", "write", "edit", "bash", "exec", "input", "checkout", "rewind", "archive", "unarchive", "permission", "save", "publish", "unpublish"]);
 export const hashBuffer = (value: Buffer | string): string => createHash("sha256").update(value).digest("hex");
 const isRecord = (value: unknown): value is Record<string, any> => typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -96,7 +100,7 @@ export interface BashJournal {
 	version: 1;
 	type: "bash";
 	/** Distinguishes a one-shot Bash transaction from a persistent Term epoch. */
-	operation?: "bash" | "term";
+	operation?: "bash" | "term" | "save";
 	/** Stable identity reserved before physical execution for idempotent replay. */
 	effectId?: string;
 	/** Stable Term epoch identity; optional for journals written by early v6 runtimes. */
@@ -141,6 +145,7 @@ interface PersistedAgentStateV5 {
 }
 
 interface PersistedParticipantEnvelopeV6 {
+	branches?: import("./model.js").AgentBranches;
 	participant: PersistedParticipantStateV6;
 	history: PersistedAgentNodeV5[];
 	checkpoints: PersistedCheckpointV5[];
@@ -152,13 +157,13 @@ type PersistedMessageStateV5 = Omit<MessageRecord, "id" | "targetId">;
 export type PersistedDeltaEntryV5 =
 	| { variable: string; state: PersistedFileStateV5; type: "File"; owner: ParticipantId }
 	| { variable: string; state: null; type: "FileRegion"; owner: ParticipantId }
-	| { variable: string; state: null; type: "Web"; owner: ParticipantId }
+	| { variable: string; state: null; type: "Web" | "Net"; owner: ParticipantId }
 	| { variable: ParticipantId; state: PersistedAgentStateV5; type: "Agent"; owner: ParticipantId }
 	| { variable: string; state: PersistedMessageStateV5; type: "Message"; owner: ParticipantId };
 
 export type PersistedGammaEntryV5 = {
 	variable: string;
-	type: "&File" | "&FileRegion" | "&Web" | "&Agent" | "&>Agent";
+	type: "&File" | "&FileRegion" | "&Web" | "&Net" | "&Agent" | "&>Agent";
 	owners: ParticipantId[];
 };
 
@@ -186,17 +191,26 @@ export type PersistedDeltaEntryV6 =
 	| { variable: string; state: PersistedFileStateV5; type: "File"; owner: ParticipantId }
 	| { variable: string; state: null; type: "FileRegion"; owner: ParticipantId }
 	| { variable: string; state: null; type: "Web"; owner: ParticipantId }
+	| { variable: string; state: { derivedFrom?: string }; type: "Net"; owner: ParticipantId }
 	| { variable: ParticipantId; state: PersistedParticipantEnvelopeV6; type: "Human" | "Agent" | "Term"; owner: ParticipantId }
 	| { variable: string; state: PersistedMessageStateV5; type: "Message"; owner: ParticipantId };
 
 export type PersistedGammaEntryV6 = {
 	variable: string;
-	type: "&File" | "&FileRegion" | "&Web" | "&Human" | "&Agent" | "&Term" | "&>Human" | "&>Agent" | "&>Term";
+	type: "&File" | "&FileRegion" | "&Web" | "&Net" | "&Human" | "&Agent" | "&Term" | "&>Human" | "&>Agent" | "&>Term";
 	owners: ParticipantId[];
 };
 
 interface PersistedRuntimeMetadataV6 extends Omit<PersistedRuntimeMetadataV5, "effects"> {
 	effects: AuthorityState["effects"];
+	explicitAuthority?: boolean;
+	initialPermissions?: string[];
+	archived?: boolean;
+	archives?: AuthorityState["archives"];
+	workspaceContexts?: AuthorityState["contexts"];
+	workspaceFiles?: AuthorityState["workspaceFiles"];
+	saveBaseline?: AuthorityState["saveBaseline"];
+	runtimeEvents?: AuthorityState["runtimeEvents"];
 	/** Optional for compatibility with v6 ledgers written before tombstones. */
 	participantTombstones?: ParticipantTombstone[];
 	/** Optional for compatibility with v6 ledgers written before durable Term logs. */
@@ -204,7 +218,7 @@ interface PersistedRuntimeMetadataV6 extends Omit<PersistedRuntimeMetadataV5, "e
 }
 
 export interface PersistedLedgerV6 {
-	schemaVersion: 6;
+	schemaVersion: 6 | 7 | 8;
 	Delta: PersistedDeltaEntryV6[];
 	Gamma: PersistedGammaEntryV6[];
 	runtimeMetadata: PersistedRuntimeMetadataV6;
@@ -215,11 +229,11 @@ export interface LedgerV5MigrationOptions {
 	restoreArchived?: boolean;
 }
 
-const persistedType = (kind: "file" | "file-region" | "web"): "File" | "FileRegion" | "Web" =>
-	kind === "file" ? "File" : kind === "file-region" ? "FileRegion" : "Web";
+const persistedType = (kind: "file" | "file-region" | "web" | "net"): "File" | "FileRegion" | "Web" | "Net" =>
+	kind === "file" ? "File" : kind === "file-region" ? "FileRegion" : kind === "net" ? "Net" : "Web";
 
-const pointerType = (kind: "file" | "file-region" | "web"): "&File" | "&FileRegion" | "&Web" =>
-	kind === "file" ? "&File" : kind === "file-region" ? "&FileRegion" : "&Web";
+const pointerType = (kind: "file" | "file-region" | "web" | "net"): "&File" | "&FileRegion" | "&Web" | "&Net" =>
+	kind === "file" ? "&File" : kind === "file-region" ? "&FileRegion" : kind === "net" ? "&Net" : "&Web";
 
 const persistedParticipantType = (kind: ParticipantKind): "Human" | "Agent" | "Term" =>
 	kind === "human" ? "Human" : kind === "term" ? "Term" : "Agent";
@@ -256,15 +270,15 @@ function encodeTermEpochs(state: AuthorityState): TermEpochRecord[] {
 	return records.sort(compareTermEpoch);
 }
 
-function nativeFilePath(variable: string, region: boolean, base: string, privateRoots: string | string[]): string {
+function nativeFilePath(variable: string, region: boolean, base: string, privateRoots: string | string[], enforceBase = true): string {
 	try {
 		const parsed = parseFileResourceReference(variable);
 		const lexicalPath = resolve(base, parsed.address);
-		if (!isInside(lexicalPath, base)) throw new Error("identity is lexically outside the session base");
+		if (enforceBase && !isInside(lexicalPath, base)) throw new Error("identity is lexically outside the session base");
 		const boundaries = Array.isArray(privateRoots) ? privateRoots : [privateRoots];
 		if (boundaries.some((privateRoot) => isInside(lexicalPath, resolve(privateRoot)))) throw new Error("identity is lexically inside Linden runtime state");
 		const path = canonicalCandidate(parsed.address, base);
-		if (!isInside(path, base)) throw new Error("identity resolves outside the session base");
+		if (enforceBase && !isInside(path, base)) throw new Error("identity resolves outside the session base");
 		if (boundaries.some((privateRoot) => isInside(path, resolve(privateRoot)))) throw new Error("identity resolves inside Linden runtime state");
 		if (fileResourceId(path, parsed.region) !== variable || parsed.region !== region) throw new Error("identity is not canonical for its declared type");
 		return path;
@@ -303,7 +317,7 @@ function webSelector(variable: string): string {
 
 const messageStateFields = new Set([
 	"sequence", "kind", "senderId", "payloadEntryId", "sentAt", "deliveryBatchId", "queuedAt",
-	"deliveredAt", "consumedAt", "consumedBy", "origin", "sourceEntryId",
+	"deliveredAt", "consumedAt", "consumedBy", "origin", "sourceEntryId", "deferred",
 ]);
 
 function assertMessageState(value: unknown, label: string, extraFields: string[] = []): asserts value is Record<string, any> {
@@ -319,6 +333,7 @@ function assertMessageState(value: unknown, label: string, extraFields: string[]
 		|| (value.consumedAt !== undefined && (typeof value.consumedAt !== "number" || !Number.isFinite(value.consumedAt)))
 		|| (value.consumedBy !== undefined && typeof value.consumedBy !== "string")
 		|| (value.origin !== undefined && value.origin !== "explicit" && value.origin !== "assistant_final")
+		|| (value.deferred !== undefined && typeof value.deferred !== "boolean")
 		|| (value.sourceEntryId !== undefined && typeof value.sourceEntryId !== "string")) throw new Error(`INVALID_LEDGER_V6: malformed Message ${label}`);
 }
 
@@ -334,8 +349,13 @@ function addGroupedGamma(
 	groups.set(key, entry);
 }
 
-export function encodeLedgerV6(state: AuthorityState): PersistedLedgerV6 {
-	if (state.schemaVersion !== 6) throw new Error(`INVALID_RUNTIME_STATE: expected schemaVersion 6, received ${String(state.schemaVersion)}`);
+/** Encode the shared typed-ledger layout; v8 persists Agent branch references. */
+export function encodeLedger(state: AuthorityState): PersistedLedgerV6 {
+	for (const [id, branches] of Object.entries(state.agentBranches ?? {})) {
+		if (state.participants[id]?.kind !== "agent") throw new Error(`INVALID_AGENT_BRANCHES: unknown Agent ${id}`);
+		validateAgentBranches(branches, id, state.agentStates, state.currentAgentStateIds[id]);
+	}
+	if (state.schemaVersion !== 6 && state.schemaVersion !== 7 && state.schemaVersion !== 8) throw new Error(`INVALID_RUNTIME_STATE: expected schemaVersion 6, 7 or 8, received ${String(state.schemaVersion)}`);
 	const Delta: PersistedDeltaEntryV6[] = [];
 	const owners = new Map<string, ParticipantId>();
 	const historyByParticipant = new Map<ParticipantId, PersistedAgentNodeV5[]>();
@@ -375,6 +395,12 @@ export function encodeLedgerV6(state: AuthorityState): PersistedLedgerV6 {
 					Delta.push({ variable: value.identity, state: null, type: value.type, owner });
 					break;
 				}
+				case "Net": {
+					const resource = state.resources[value.identity];
+					if (resource?.kind !== "net") throw new Error("INVALID_RUNTIME_NET");
+					Delta.push({ variable: value.identity, state: { derivedFrom: resource.derivedFrom }, type: "Net", owner });
+					break;
+				}
 				case "Human":
 				case "Agent":
 				case "Term": {
@@ -389,7 +415,9 @@ export function encodeLedgerV6(state: AuthorityState): PersistedLedgerV6 {
 							participant,
 							history: record.kind === "agent" ? historyByParticipant.get(value.identity) ?? [] : [],
 							checkpoints: record.kind === "agent" ? checkpointsByParticipant.get(value.identity) ?? [] : [],
-							current: record.kind === "agent" ? state.currentAgentStateIds[value.identity] : undefined,
+							...(record.kind === "agent" ? state.schemaVersion >= 8
+								? { branches: state.agentBranches?.[value.identity] ?? legacyAgentBranches(state.currentAgentStateIds[value.identity]) }
+								: { current: state.currentAgentStateIds[value.identity] } : {}),
 						},
 						type: persistedParticipantType(record.kind),
 						owner,
@@ -424,6 +452,7 @@ export function encodeLedgerV6(state: AuthorityState): PersistedLedgerV6 {
 	}
 	for (const [holder, context] of Object.entries(state.contexts)) {
 		const participant = state.participants[holder];
+		if (!participant && holder === "environment") continue;
 		if (!participant) throw new Error(`INVALID_RUNTIME_STATE: context exists for unknown participant ${holder}`);
 		for (const resourceId of context.gamma.resourcePointers) {
 			const resource = state.resources[resourceId];
@@ -448,11 +477,19 @@ export function encodeLedgerV6(state: AuthorityState): PersistedLedgerV6 {
 		.map(({ deliveryBatchId: _deliveryBatchId, queuedAt: _queuedAt, ...receipt }) => receipt);
 	const termEpochs = encodeTermEpochs(state);
 	return {
-		schemaVersion: 6,
+		schemaVersion: state.schemaVersion,
 		Delta,
 		Gamma,
 			runtimeMetadata: {
 			sessionId: state.sessionId,
+			explicitAuthority: state.explicitAuthority,
+			initialPermissions: state.initialPermissions,
+			archived: state.archived,
+			archives: state.archives,
+			workspaceContexts: state.workspaceContexts,
+			workspaceFiles: state.workspaceFiles,
+			saveBaseline: state.saveBaseline,
+			runtimeEvents: state.runtimeEvents,
 			base: state.base,
 			...(state.maxAgentDepth === undefined ? {} : { maxAgentDepth: state.maxAgentDepth }),
 			createdAt: state.createdAt,
@@ -469,14 +506,16 @@ export function encodeLedgerV6(state: AuthorityState): PersistedLedgerV6 {
 	};
 }
 
-const deltaTypesV6 = new Set(["File", "FileRegion", "Web", "Human", "Agent", "Term", "Message"]);
-const gammaTypesV6 = new Set(["&File", "&FileRegion", "&Web", "&Human", "&Agent", "&Term", "&>Human", "&>Agent", "&>Term"]);
+const deltaTypesV6 = new Set(["File", "FileRegion", "Web", "Net", "Human", "Agent", "Term", "Message"]);
+const gammaTypesV6 = new Set(["&File", "&FileRegion", "&Web", "&Net", "&Human", "&Agent", "&Term", "&>Human", "&>Agent", "&>Term"]);
 
-export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string, privateRoots: string | string[] = []): AuthorityState {
-	if (ledger.schemaVersion !== 6 || !Array.isArray(ledger.Delta) || !Array.isArray(ledger.Gamma) || !isRecord(ledger.runtimeMetadata)) {
+/** Decode v6/v7, retaining historical validation rules and diagnostics. */
+export function decodeLedger(ledger: PersistedLedgerV6, expectedBase?: string, privateRoots: string | string[] = []): AuthorityState {
+	if ((ledger.schemaVersion !== 6 && ledger.schemaVersion < 7 && ledger.schemaVersion !== 8) || !Array.isArray(ledger.Delta) || !Array.isArray(ledger.Gamma) || !isRecord(ledger.runtimeMetadata)) {
 		throw new Error("INVALID_LEDGER_V6: expected Delta, Gamma, and runtimeMetadata");
 	}
 	const metadata = ledger.runtimeMetadata;
+	if (ledger.schemaVersion >= 7 && (metadata.explicitAuthority !== true || !Array.isArray(metadata.initialPermissions) || metadata.initialPermissions.some((value) => typeof value !== "string" || !/^&?(file:|net:)/.test(value)) || (metadata.archived !== undefined && typeof metadata.archived !== "boolean"))) throw new Error("INVALID_LEDGER_V7: explicit authority metadata required");
 	if (typeof metadata.sessionId !== "string" || typeof metadata.base !== "string" || typeof metadata.rootParticipantId !== "string"
 		|| !Number.isFinite(metadata.createdAt) || !Number.isFinite(metadata.lastOpenedAt) || !Number.isSafeInteger(metadata.sequence) || metadata.sequence < 0
 		|| !Array.isArray(metadata.effects) || !Array.isArray(metadata.messageReceipts)) {
@@ -499,6 +538,7 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 	const checkpoints = Object.create(null) as AuthorityState["checkpoints"];
 	const agentStates = Object.create(null) as AuthorityState["agentStates"];
 	const currentAgentStateIds = Object.create(null) as AuthorityState["currentAgentStateIds"];
+	const agentBranches: NonNullable<AuthorityState["agentBranches"]> = Object.create(null);
 	const participantTombstones = Object.create(null) as AuthorityState["participantTombstones"];
 	const termEpochs = Object.create(null) as AuthorityState["termEpochs"];
 	const deltaTypes = new Map<string, PersistedDeltaEntryV6["type"]>();
@@ -518,6 +558,7 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 		if (deltaTypes.has(entry.variable)) throw new Error(`INVALID_LEDGER_V6: duplicate Delta variable ${entry.variable}`);
 		deltaTypes.set(entry.variable, entry.type);
 		deltaOwners.set(entry.variable, entry.owner);
+		if (entry.owner === "environment" && (ledger.schemaVersion < 7 || !["File", "FileRegion", "Net", "Web"].includes(entry.type))) throw new Error("INVALID_ENVIRONMENT_BINDING");
 		if (entry.type !== "Human" && entry.type !== "Agent" && entry.type !== "Term") continue;
 		if (entry.owner !== entry.variable) throw new Error(`INVALID_LEDGER_V6: participant ${entry.variable} is not self-held`);
 		if (!isRecord(entry.state) || !isRecord(entry.state.participant) || !Array.isArray(entry.state.history) || !Array.isArray(entry.state.checkpoints)) {
@@ -533,7 +574,7 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 			|| Object.keys(participantState).some((key) => !PARTICIPANT_FIELDS.has(key))) throw new Error(`INVALID_LEDGER_V6: malformed participant state ${entry.variable}`);
 		if (!entry.variable.startsWith(`${participantState.kind}:`) || entry.variable.endsWith(":") || persistedParticipantType(participantState.kind as ParticipantKind) !== entry.type) throw new Error(`INVALID_LEDGER_V6: participant variable ${entry.variable} does not match ${entry.type}`);
 		if (participantState.kind !== "agent" && (participantState.piSessionId !== undefined || participantState.sessionFile !== undefined)) throw new Error(`INVALID_LEDGER_V6: only Agent may bind a Pi session (${entry.variable})`);
-		if (participantState.kind !== "agent" && (entry.state.history.length > 0 || entry.state.checkpoints.length > 0 || entry.state.current !== undefined)) throw new Error(`INVALID_LEDGER_V6: ${entry.type} ${entry.variable} cannot carry Agent history`);
+		if (participantState.kind !== "agent" && (entry.state.history.length > 0 || entry.state.checkpoints.length > 0 || entry.state.current !== undefined || entry.state.branches !== undefined)) throw new Error(`INVALID_LEDGER_V6: ${entry.type} ${entry.variable} cannot carry Agent history`);
 		if (participantState.piSessionId !== undefined) {
 			const previous = piSessionOwners.get(participantState.piSessionId);
 			if (previous) throw new Error(`INVALID_LEDGER_V6: Pi session ${participantState.piSessionId} is shared by ${previous} and ${entry.variable}`);
@@ -566,6 +607,15 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 			if (typeof entry.state.current !== "string" || agentStates[entry.state.current]?.participantId !== entry.variable) throw new Error(`INVALID_LEDGER_V6: Agent ${entry.variable} has an invalid current state`);
 			currentAgentStateIds[entry.variable] = entry.state.current;
 		}
+		if (participantState.kind === "agent") {
+			if (ledger.schemaVersion >= 8 && (entry.state.branches === undefined || entry.state.current !== undefined)) throw new Error(`INVALID_LEDGER_V8: Agent ${entry.variable} requires branch references instead of current`);
+			const branches = entry.state.branches ?? legacyAgentBranches(entry.state.current);
+			const head = branches?.heads && Object.hasOwn(branches.heads, branches.current) ? branches.heads[branches.current] : undefined;
+			validateAgentBranches(branches, entry.variable, agentStates, head);
+			if (entry.state.current !== undefined && entry.state.current !== head) throw new Error(`INVALID_AGENT_CURRENT_BRANCH: ${entry.variable}`);
+			agentBranches[entry.variable] = structuredClone(branches);
+			if (head !== undefined) currentAgentStateIds[entry.variable] = head;
+		}
 	}
 	for (const node of Object.values(agentStates)) {
 		if (checkpoints[node.checkpointId]?.participantId !== node.participantId) throw new Error(`INVALID_LEDGER_V6: Agent state ${node.id} has an out-of-scope checkpoint`);
@@ -577,7 +627,7 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 	if (!Array.isArray(tombstoneValues)) throw new Error("INVALID_LEDGER_V6: participantTombstones must be an array");
 	const tombstoneFields = new Set([
 		"id", "name", "kind", "parentId", "childIds", "piSessionId", "sessionFile", "status", "createdAt",
-		"archivedAt", "archivedBy", "archiveEffectId",
+		"archivedAt", "archivedBy", "archiveEffectId", "rootDir", "permissionMode",
 	]);
 	let previousTombstoneId: string | undefined;
 	for (const candidate of tombstoneValues) {
@@ -666,6 +716,7 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 	}
 	for (const effect of metadata.effects) {
 		if (effect.kind !== "archive") continue;
+		if (ledger.schemaVersion >= 7 && (effect.targetId === metadata.rootParticipantId || metadata.effects.some((later) => later.kind === "unarchive" && later.targetId === effect.targetId && later.sequence > effect.sequence))) continue;
 		const root = effect.targetId === undefined ? undefined : participantTombstones[effect.targetId];
 		if (!root || root.archiveEffectId !== effect.id || root.parentId !== effect.participantId) {
 			throw new Error(`INVALID_LEDGER_V6: archive effect ${effect.id} does not identify its retired direct-child root`);
@@ -693,6 +744,7 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 		if ((checkpoint.authority.parent !== undefined && !knownParticipant(checkpoint.authority.parent))
 			|| checkpoint.authority.children.some((id) => !knownParticipant(id))) throw new Error(`INVALID_LEDGER_V6: checkpoint ${checkpoint.id} names an unknown historical participant`);
 	}
+	if (ledger.schemaVersion >= 7 && ledger.Delta.some((entry) => entry.owner === "environment")) contexts.environment = { delta: { completeValues: [] }, gamma: { resourcePointers: [], agentPointers: [], roles: [] } };
 	for (const entry of ledger.Delta) {
 		const context = contexts[entry.owner];
 		if (!context) throw new Error(`INVALID_LEDGER_V6: Delta owner ${entry.owner} is not a participant`);
@@ -732,7 +784,7 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 				resources[entry.variable] = {
 					id: entry.variable,
 					kind: "file",
-					path: nativeFilePath(entry.variable, false, ledgerBase, privateRoots),
+					path: nativeFilePath(entry.variable, false, ledgerBase, privateRoots, ledger.schemaVersion === 6),
 					versioned: true,
 					versions: entry.state.versions,
 					currentVersionId: entry.state.current,
@@ -740,15 +792,24 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 					createdAt: entry.state.versions[0]?.createdAt ?? metadata.createdAt,
 				};
 				context.delta.completeValues.push({ identity: entry.variable, type: "File", stateId: entry.state.current });
-				context.gamma.resourcePointers.push(entry.variable);
+				if (entry.owner !== "environment") context.gamma.resourcePointers.push(entry.variable);
 				break;
 			}
 			case "FileRegion": {
 				const variable = entry.variable;
 				if (entry.state !== null) throw new Error(`INVALID_LEDGER_V6: FileRegion ${variable} state must be null`);
-				resources[entry.variable] = { id: entry.variable, kind: "file-region", path: nativeFilePath(entry.variable, true, ledgerBase, privateRoots), createdAt: metadata.createdAt };
+				resources[entry.variable] = { id: entry.variable, kind: "file-region", path: nativeFilePath(entry.variable, true, ledgerBase, privateRoots, ledger.schemaVersion === 6), createdAt: metadata.createdAt };
 				context.delta.completeValues.push({ identity: entry.variable, type: "FileRegion" });
-				context.gamma.resourcePointers.push(entry.variable);
+				if (entry.owner !== "environment") context.gamma.resourcePointers.push(entry.variable);
+				break;
+			}
+			case "Net": {
+				if (ledger.schemaVersion < 7 || !isRecord(entry.state) || Object.keys(entry.state).some((key) => key !== "derivedFrom") || (entry.state.derivedFrom !== undefined && entry.state.derivedFrom !== "net:tcp/public")) throw new Error("INVALID_NET_BINDING");
+				const endpoint = netReference(entry.variable);
+				if (endpoint.id !== entry.variable) throw new Error("NON_CANONICAL_NET");
+				resources[entry.variable] = { ...endpoint, kind: "net", derivedFrom: entry.state.derivedFrom, createdAt: metadata.createdAt };
+				context.delta.completeValues.push({ identity: entry.variable, type: "Net" });
+				if (entry.owner !== "environment") context.gamma.resourcePointers.push(entry.variable);
 				break;
 			}
 			case "Web": {
@@ -756,7 +817,7 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 				if (entry.state !== null) throw new Error(`INVALID_LEDGER_V6: Web ${variable} state must be null`);
 				resources[entry.variable] = { id: entry.variable, kind: "web", domains: [webSelector(entry.variable)], createdAt: metadata.createdAt };
 				context.delta.completeValues.push({ identity: entry.variable, type: "Web" });
-				context.gamma.resourcePointers.push(entry.variable);
+				if (entry.owner !== "environment") context.gamma.resourcePointers.push(entry.variable);
 				break;
 			}
 			case "Human":
@@ -868,8 +929,16 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 		context.gamma.resourcePointers = [...new Set(context.gamma.resourcePointers)];
 	}
 
-	return {
-		schemaVersion: 6,
+	const state: AuthorityState = {
+		schemaVersion: ledger.schemaVersion,
+		explicitAuthority: metadata.explicitAuthority,
+		initialPermissions: metadata.initialPermissions,
+		archived: metadata.archived,
+		archives: metadata.archives,
+		workspaceContexts: metadata.workspaceContexts,
+		workspaceFiles: metadata.workspaceFiles,
+		saveBaseline: metadata.saveBaseline,
+		runtimeEvents: metadata.runtimeEvents,
 		sessionId: metadata.sessionId,
 		base: metadata.base,
 		...(metadata.maxAgentDepth === undefined ? {} : { maxAgentDepth: metadata.maxAgentDepth }),
@@ -886,8 +955,88 @@ export function decodeLedgerV6(ledger: PersistedLedgerV6, expectedBase?: string,
 		checkpoints,
 		agentStates,
 		currentAgentStateIds,
+		agentBranches,
 		termEpochs,
 	};
+	if (ledger.schemaVersion >= 7) validateRecoveryMetadata(state, privateRoots);
+	return state;
+}
+
+/** @deprecated Use encodeLedger; this alias also supports schemaVersion 7 and 8. */
+export const encodeLedgerV6 = encodeLedger;
+/** @deprecated Use decodeLedger; this alias also supports schemaVersion 7 and 8. */
+export const decodeLedgerV6 = decodeLedger;
+
+function validateRecoveryMetadata(state: AuthorityState, privateRoots: string | string[]): void {
+	const fail = (message: string): never => { throw new Error(`INVALID_LEDGER_V7: ${message}`); };
+	const snapshots = (items: unknown): void => {
+		if (!isRecord(items)) fail("snapshot collection must be a record");
+		for (const [path, snapshot] of Object.entries(items as Record<string, unknown>)) {
+			nativeFilePath(fileResourceId(path), false, state.base, privateRoots, false);
+			assertSnapshotRef(snapshot, path, "INVALID_LEDGER_V7");
+		}
+	};
+	for (const participant of [...Object.values(state.participants), ...Object.values(state.participantTombstones)]) {
+		if (participant.rootDir !== undefined && (typeof participant.rootDir !== "string" || !isAbsolute(participant.rootDir) || canonicalCandidate(participant.rootDir, state.base) !== participant.rootDir)) fail("invalid participant root");
+		if (participant.permissionMode !== undefined && participant.permissionMode !== "manual" && participant.permissionMode !== "all-of-mine") fail("invalid permission policy");
+	}
+	if (state.saveBaseline !== undefined) snapshots(state.saveBaseline);
+	if (state.workspaceFiles !== undefined) snapshots(state.workspaceFiles);
+	if (state.archived) {
+		if (!isRecord(state.workspaceContexts) || !isRecord(state.workspaceFiles)) fail("archived workspace has no recovery template");
+		const restored = { ...state, contexts: state.workspaceContexts!, archived: false };
+		assertWellFormedContexts(restored);
+		for (const context of Object.values(state.contexts)) if (context !== state.contexts.environment && (context.gamma.resourcePointers.length || context.delta.completeValues.some((value) => !!state.resources[value.identity]))) fail("archived workspace still grants resource authority");
+	} else if (state.workspaceContexts !== undefined || state.workspaceFiles !== undefined) fail("active workspace has an archive template");
+	const eventIds = new Set<string>();
+	if (state.runtimeEvents !== undefined && !Array.isArray(state.runtimeEvents)) fail("runtime events must be an array");
+	for (const event of state.runtimeEvents ?? []) {
+		if (!isRecord(event) || typeof event.id !== "string" || !event.id.startsWith("runtime:") || eventIds.has(event.id) || typeof event.text !== "string" || !["restore", "authority-change", "fork", "rewind"].includes(event.kind) || (!state.participants[event.participantId] && !state.participantTombstones[event.participantId]) || (event.delivered !== undefined && typeof event.delivered !== "boolean")) fail("malformed runtime event");
+		eventIds.add(event.id);
+	}
+	if (state.archives !== undefined && !isRecord(state.archives)) fail("archives must be a record");
+	for (const [rootId, template] of Object.entries(state.archives ?? {})) {
+		if (!isRecord(template) || ["participants", "contexts", "checkpoints", "agentStates", "currentAgentStateIds", "messages", "files"].some((key) => !isRecord((template as any)[key]))) fail("malformed subtree recovery template");
+		snapshots(template.files);
+		const root = template.participants[rootId];
+		if (!root || !root.parentId || !state.participantTombstones[rootId] || JSON.stringify(root.childIds) !== JSON.stringify(state.participantTombstones[rootId].childIds)) fail("archive root has no matching retained subtree");
+		const restored = structuredClone(state);
+		const ids = Object.keys(template.participants);
+		for (const id of ids) {
+			const tombstone = state.participantTombstones[id];
+			const participant = template.participants[id];
+			if (!tombstone || state.participants[id] || participant.id !== id || participant.kind !== tombstone.kind || participant.parentId !== tombstone.parentId || participant.sessionFile !== tombstone.sessionFile || !template.contexts[id]) fail("template disagrees with its tombstones");
+			restored.participants[id] = participant;
+			delete restored.participantTombstones[id];
+		}
+		const transferred = new Set(Object.values(template.contexts).flatMap((context) => context.delta.completeValues.map((value) => value.identity)));
+		for (const context of Object.values(restored.contexts)) context.delta.completeValues = context.delta.completeValues.filter((value) => !transferred.has(value.identity));
+		Object.assign(restored.contexts, structuredClone(template.contexts));
+		for (const id of ids) for (const value of restored.contexts[id].delta.completeValues) {
+			const resource = state.resources[value.identity];
+			if (resource?.kind === "file") value.stateId = resource.currentVersionId;
+		}
+		Object.assign(restored.messages, template.messages);
+		Object.assign(restored.agentStates, template.agentStates);
+		Object.assign(restored.checkpoints, template.checkpoints);
+		Object.assign(restored.currentAgentStateIds, template.currentAgentStateIds);
+		if (template.agentBranches !== undefined && !isRecord(template.agentBranches)) fail("malformed archived Agent branches");
+		for (const [id, participant] of Object.entries(template.participants)) {
+			if (participant.kind !== "agent") continue;
+			const branches = template.agentBranches?.[id] ?? legacyAgentBranches(template.currentAgentStateIds[id]);
+			validateAgentBranches(branches, id, template.agentStates, template.currentAgentStateIds[id]);
+			(restored.agentBranches ??= {})[id] = branches;
+		}
+		for (const id of Object.keys(template.agentBranches ?? {})) if (template.participants[id]?.kind !== "agent") fail("archived branch belongs to a non-Agent");
+		const parent = restored.participants[root.parentId!];
+		// A parent may itself have been archived subsequently. Its enclosing
+		// template will be checked when it is restored; no live edge is forged.
+		if (parent) {
+			parent.childIds.push(rootId);
+			restored.contexts[parent.id].gamma.roles.push({ targetId: rootId, role: "parent" });
+			assertWellFormedContexts(restored);
+		}
+	}
 }
 
 /**
@@ -959,6 +1108,10 @@ export function atomicJson(path: string, value: unknown, pretty = true): void {
 }
 
 export class AuthorityStore {
+	appendNetworkAudit(record: { at: number; participantId: string; endpoint: string; address: string }): void {
+		appendFileSync(join(this.stateDir, "network-audit.jsonl"), JSON.stringify(record) + "\n", { mode: 0o600, flush: true });
+	}
+
 	readonly ledgerPath: string;
 	readonly blobDir: string;
 	readonly journalDir: string;
@@ -981,12 +1134,12 @@ export class AuthorityStore {
 			throw new Error(`UNSUPPORTED_LEDGER_V${String(parsed.schemaVersion)}: pre-v5 Linden ledgers are not migrated; create a new session`);
 		}
 		if (parsed.schemaVersion === 5) throw new Error("LEDGER_V5_REQUIRES_EXPLICIT_MIGRATION: call AuthorityStore.migrateV5() before opening this session");
-		if (parsed.schemaVersion !== 6) throw new Error(`Unsupported Linden ledger version ${String(parsed.schemaVersion)}`);
-		return decodeLedgerV6(parsed as PersistedLedgerV6, expectedBase, privateRoots);
+		if (parsed.schemaVersion !== 6 && parsed.schemaVersion !== 7 && parsed.schemaVersion !== 8) throw new Error(`Unsupported Linden ledger version ${String(parsed.schemaVersion)}`);
+		return decodeLedger(parsed as PersistedLedgerV6, expectedBase, privateRoots);
 	}
 
 	save(state: AuthorityState): void {
-		atomicJson(this.ledgerPath, encodeLedgerV6(state), false);
+		atomicJson(this.ledgerPath, encodeLedger(state), false);
 	}
 
 	migrateV5(options: LedgerV5MigrationOptions = {}, expectedBase?: string, privateRoots: string | string[] = []): AuthorityState {
@@ -994,7 +1147,7 @@ export class AuthorityStore {
 		const parsed = JSON.parse(readFileSync(this.ledgerPath, "utf8")) as { schemaVersion?: unknown };
 		if (parsed.schemaVersion !== 5) throw new Error(`MIGRATION_REQUIRES_LEDGER_V5: found ${String(parsed.schemaVersion)}`);
 		const ledger = migrateLedgerV5ToV6(parsed as PersistedLedgerV5, options);
-		const state = decodeLedgerV6(ledger, expectedBase, privateRoots);
+		const state = decodeLedger(ledger, expectedBase, privateRoots);
 		atomicJson(this.ledgerPath, ledger, false);
 		return state;
 	}

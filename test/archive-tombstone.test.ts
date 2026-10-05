@@ -140,7 +140,7 @@ test("tombstones are not resolvable participants and retain no live authority wh
 			denyWritePaths: [],
 			absentWriteFileExclusions: [],
 			unsafeAbsentWriteExclusions: [],
-			webDomains: [],
+			webDomains: [], netEndpoints: [], netExclusions: [],
 		});
 		await assert.rejects(reopened.readFile(child, "retired.txt"), /UNKNOWN_PARTICIPANT/);
 	} finally {

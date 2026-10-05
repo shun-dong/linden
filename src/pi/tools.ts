@@ -1,20 +1,20 @@
 import {
 	createBashTool,
 	createEditTool,
-	createReadTool,
 	createWriteTool,
 	DEFAULT_MAX_BYTES,
 	formatSize,
-	truncateHead,
 	truncateTail,
 	type AgentToolResult,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
+import { authorizedReadTool } from "./read.js";
 import type { ParticipantId, VersionId } from "../runtime/model.js";
 import { canonicalCandidate } from "../runtime/paths.js";
-import { participantCoordinator, participantReference } from "./participant-api.js";
+import { participantReference, type ParticipantCoordinatorApi } from "./participant-api.js";
 import type { PiCoordinator } from "./runtime.js";
+import { formatBatchTransfer, formatTransferResult, transferInputs } from "./transfers.js";
 
 const participantFields = { participant: Type.Optional(Type.String()), agent: Type.Optional(Type.String()) };
 const participantSchema = Type.Object(participantFields);
@@ -25,6 +25,7 @@ const agentSpawnSchema = Type.Object({
 	kind: Type.Optional(Type.Union([Type.Literal("agent"), Type.Literal("term")])),
 	prompt: Type.Optional(Type.String()),
 	name: Type.Optional(Type.String()),
+	rootDir: Type.Optional(Type.String()),
 	resources: Type.Optional(Type.Array(Type.String())),
 	inheritRead: Type.Optional(Type.Boolean()),
 	inheritWorkspaceRead: Type.Optional(Type.Boolean()),
@@ -32,14 +33,17 @@ const agentSpawnSchema = Type.Object({
 const termSpawnSchema = Type.Object({
 	kind: Type.Optional(Type.Literal("term")),
 	name: Type.Optional(Type.String()),
+	rootDir: Type.Optional(Type.String()),
 	resources: Type.Optional(Type.Array(Type.String())),
 	inheritRead: Type.Optional(Type.Boolean()),
 	inheritWorkspaceRead: Type.Optional(Type.Boolean()),
 });
 const participantsSchema = Type.Object({});
 const statSchema = Type.Object({ path: Type.String() });
-const transferSchema = Type.Object({ ...participantFields, resource: Type.String() });
+const transferSchema = Type.Object({ ...participantFields, resource: Type.Optional(Type.String()), resources: Type.Optional(Type.Array(Type.String(), { minItems: 1 })) });
 const checkoutSchema = Type.Object({ resource: Type.String(), state: Type.String() });
+const branchSchema = Type.Object({ ...participantFields, name: Type.String(), state: Type.Optional(Type.String()) });
+const switchSchema = Type.Object({ ...participantFields, name: Type.String() });
 const rewindSchema = Type.Object({ ...participantFields, state: Type.String() });
 const logSchema = Type.Object({ target: Type.String() });
 const authoritySchema = Type.Object({ participant: Type.Optional(Type.String()) });
@@ -50,10 +54,10 @@ const termInputSchema = Type.Object({ ...participantFields, data: Type.String() 
 const textResult = (text: string, details?: unknown): AgentToolResult<any> => ({ content: [{ type: "text", text }], details });
 
 export function buildTools(coordinator: PiCoordinator, participantId: ParticipantId, sessionCwd?: string): ToolDefinition[] {
-	const participantApi = participantCoordinator(coordinator);
+	const participantApi: ParticipantCoordinatorApi = coordinator;
 	const cwd = sessionCwd ?? coordinator.runtimes?.get(participantId)?.cwd ?? coordinator.authority.workspace;
 	const filePath = (input: string): string => canonicalCandidate(input, cwd);
-	const read = createReadTool(cwd);
+	const read = authorizedReadTool(coordinator.authority, participantId, cwd);
 	const write = createWriteTool(cwd);
 	const edit = createEditTool(cwd);
 	const bash = createBashTool(cwd);
@@ -62,8 +66,8 @@ export function buildTools(coordinator: PiCoordinator, participantId: Participan
 		name: "spawn",
 		label: agentSpawnEnabled ? "spawn (Linden)" : "spawn Term (Linden)",
 		description: agentSpawnEnabled
-			? "Spawn an Agent or Term child participant; kind defaults to agent. By default it snapshots the parent's effective File reads. resources entries must be typed references such as file:./src/ or web:example.com/: prefix & for a read grant, plain to move complete ownership. inheritRead=false opts out (inheritWorkspaceRead is a deprecated alias). prompt is used only by Agent children."
-			: "Spawn a Term child participant. Agent child spawning is disabled for this participant. By default it snapshots the parent's effective File reads. resources entries must be typed references such as file:./src/ or web:example.com/: prefix & for a read grant, plain to move complete ownership. inheritRead=false opts out (inheritWorkspaceRead is a deprecated alias).",
+			? "Spawn an Agent or Term child participant; kind defaults to agent. By default it snapshots the parent's effective File reads. resources entries must be typed references such as file:./src/ or net:tcp/dns/example.com:443. Prefix & grants a use projection (File read, Net connect); plain input moves complete ownership. inheritRead=false opts out (inheritWorkspaceRead is a deprecated alias). prompt is used only by Agent children."
+			: "Spawn a Term child participant. Agent child spawning is disabled for this participant. By default it snapshots the parent's effective File reads. resources entries must be typed references such as file:./src/ or net:tcp/dns/example.com:443. Prefix & grants a use projection (File read, Net connect); plain input moves complete ownership. inheritRead=false opts out (inheritWorkspaceRead is a deprecated alias).",
 		promptSnippet: agentSpawnEnabled ? "Spawn a typed Agent or Term child" : "Spawn a typed Term child",
 		executionMode: "sequential",
 		parameters: agentSpawnEnabled ? agentSpawnSchema : termSpawnSchema,
@@ -75,7 +79,7 @@ export function buildTools(coordinator: PiCoordinator, participantId: Participan
 				...(agentSpawnEnabled ? { prompt: params.prompt } : {}),
 				resources: params.resources ?? [],
 				inheritRead: params.inheritRead ?? params.inheritWorkspaceRead ?? true,
-				cwd,
+				cwd: params.rootDir ? canonicalCandidate(params.rootDir, cwd) : cwd,
 				origin: "model",
 			});
 			const parentCheckpoint = await coordinator.appendCheckpointAfterCommit(participantId, "spawn");
@@ -98,32 +102,8 @@ export function buildTools(coordinator: PiCoordinator, participantId: Participan
 	const tools: ToolDefinition[] = [
 		{
 			...read,
-			label: "read (Linden authority)",
-			promptGuidelines: ["All file reads are checked against the session-global Linden ledger."],
-			async execute(_id, params: any) {
-				const result = await coordinator.authority.readFile(participantId, filePath(params.path));
-				if (result.state === "Absent") return textResult(`Absent: ${result.path} (authorized location with no content)`, { path: result.path, state: result.state, resourceId: result.resourceId });
-				const lines = result.content.split("\n");
-				const offset = params.offset === undefined ? 1 : params.offset;
-				if (!Number.isSafeInteger(offset) || offset < 1) throw new Error("offset must be a positive integer");
-				const start = offset - 1;
-				if (start >= lines.length) throw new Error(`Offset ${offset} is beyond end of file (${lines.length} lines total)`);
-				if (params.limit !== undefined && (!Number.isSafeInteger(params.limit) || params.limit < 1)) throw new Error("limit must be a positive integer");
-				const end = params.limit === undefined ? lines.length : Math.min(lines.length, start + params.limit);
-				const truncation = truncateHead(lines.slice(start, end).join("\n"));
-				let output = truncation.content;
-				if (truncation.firstLineExceedsLimit) {
-					const lineSize = formatSize(Buffer.byteLength(lines[start], "utf8"));
-					output = `[Line ${offset} is ${lineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${offset}p' ${params.path} | head -c ${DEFAULT_MAX_BYTES}]`;
-				} else if (truncation.truncated) {
-					const shownEnd = offset + truncation.outputLines - 1;
-					output += `\n\n[Showing lines ${offset}-${shownEnd} of ${lines.length}${truncation.truncatedBy === "bytes" ? ` (${formatSize(DEFAULT_MAX_BYTES)} limit)` : ""}. Use offset=${shownEnd + 1} to continue.]`;
-				} else if (end < lines.length) {
-					output += `\n\n[${lines.length - end} more lines in file. Use offset=${end + 1} to continue.]`;
-				}
-				return textResult(output, { path: result.path, state: result.state, resourceId: result.resourceId, ...(truncation.truncated || truncation.firstLineExceedsLimit ? { truncation } : {}) });
-			},
-		},
+			promptGuidelines: [...(read.promptGuidelines ?? []), "All file reads are checked against the session-global Linden ledger."],
+		} as ToolDefinition,
 		{
 			...write,
 			label: "write (Linden authority)",
@@ -224,21 +204,40 @@ export function buildTools(coordinator: PiCoordinator, participantId: Participan
 			async execute(_id, _params: Static<typeof participantsSchema>) { return textResult(await coordinator.discoverParticipantTree(participantId)); },
 		},
 		{
-			name: "give", label: "give (Linden)", description: "Transfer authority over a direct parent-child edge; completes atomically and silently. resource must be a typed file:<address> or web:<selector>/ reference: plain input moves ownership; prefix & grants a read pointer. Relative File addresses follow file:, and a trailing / is the sole File-region marker.", promptSnippet: "Move ownership or grant a read pointer to a parent or child", executionMode: "sequential", parameters: transferSchema,
-			async execute(_id, params: Static<typeof transferSchema>) { const result = await coordinator.give(participantId, participantReference(params), params.resource, cwd); await coordinator.appendCheckpointAfterCommit(participantId, "give"); return textResult(result.mode === "read" ? `Granted read pointer on ${result.moved.join(", ")} to ${result.targetId}` : `Moved ${result.moved.join(", ")} to ${result.targetId}`, result); },
+			name: "permission", label: "permission (Linden)", description: "Inspect or set your own direct-child permission request policy: manual (default) or all-of-mine (automatically give only authority you can currently grant). Never reclaims a sibling's authority.", parameters: Type.Object({ mode: Type.Optional(Type.Union([Type.Literal("manual"), Type.Literal("all-of-mine")])) }), executionMode: "sequential",
+			async execute(_id, params: { mode?: "manual" | "all-of-mine" }) {
+				if (params.mode) await coordinator.authority.setPermissionMode(participantId, params.mode);
+				return textResult(coordinator.authority.participant(participantId)?.permissionMode ?? "manual");
+			},
 		},
 		{
-			name: "get", label: "get (Linden)", description: "Take back a resource currently owned by your own direct child; accepts only a typed file:<address> or web:<selector>/ reference and auto-refines the child's bundle. Ownership transfer stays edge-scoped, so deeper recovery propagates one direct edge at a time. If an Agent owner is mid-turn, its current tool finishes and later tools are held while ownership moves; a Linden runtime notice then updates the Agent and it continues the same loop without being interrupted or stopped. An open Term epoch is never stopped implicitly: leave the resource with a required background service, or explicitly stop the Term before get.", promptSnippet: "Take back ownership from a Term or direct Agent child", executionMode: "sequential", parameters: transferSchema,
+			name: "give", label: "give (Linden)", description: "Transfer authority over a direct parent-child edge. Provide exactly one of resource (single) or resources (non-empty array). A batch runs in input order and stops at the first failure; earlier results remain committed and later items are not attempted. Each item records runtime permission notices. Ownership transfers save external changes to tracked Files as new versions and clear divergence, preserving disk bytes. Use typed file:<address> or net:tcp/<endpoint>:<port> references: plain input moves ownership; prefix & grants a use projection (File read, Net connect). Relative File addresses follow file:, and a trailing / is the sole File-region marker.", promptSnippet: "Move ownership or grant a use projection to a parent or child", executionMode: "sequential", parameters: transferSchema,
 			async execute(_id, params: Static<typeof transferSchema>) {
-				const { targetId, resourceId } = await coordinator.resolveOwnedChildResource(
-					participantId,
-					participantReference(params),
-					params.resource,
-					cwd,
-				);
-				const resources = await coordinator.getOwnedResource(participantId, targetId, resourceId);
+				const resources = transferInputs(params);
+				const target = participantReference(params);
+				if (params.resources !== undefined) {
+					const result = await coordinator.transferResources(participantId, target, resources, "give", cwd);
+					if (result.completed.length) await coordinator.appendCheckpointAfterCommit(participantId, "give");
+					return textResult(formatBatchTransfer(result), result);
+				}
+				const result = await coordinator.give(participantId, target, resources[0], cwd);
+				await coordinator.appendCheckpointAfterCommit(participantId, "give");
+				return textResult(formatTransferResult(result), result);
+			},
+		},
+		{
+			name: "get", label: "get (Linden)", description: "Get from a direct child reclaims complete ownership. Get from your direct parent only requests authority; the parent must approve or enable permission all-of-mine. Provide exactly one of resource (single) or resources (non-empty array). A batch runs in input order and stops at the first failure or unavailable permission; earlier results remain and later items are not attempted. Pending parent requests grant no authority. Ownership transfers save external changes to tracked Files as new versions and clear divergence, preserving disk bytes. &resource is permitted for parent requests; accepts typed file:<address> or net:tcp/<endpoint>:<port> references and auto-refines the child's bundle. Ownership transfer stays edge-scoped, so deeper recovery propagates one direct edge at a time. If an Agent owner is mid-turn, its current tool finishes and later tools are held while ownership moves. An open Term epoch is never stopped implicitly: leave the resource with a required background service, or explicitly stop the Term before get.", promptSnippet: "Take back ownership from a Term or direct Agent child", executionMode: "sequential", parameters: transferSchema,
+			async execute(_id, params: Static<typeof transferSchema>) {
+				const resources = transferInputs(params);
+				const target = participantReference(params);
+				if (params.resources !== undefined) {
+					const result = await coordinator.transferResources(participantId, target, resources, "get", cwd);
+					if (result.completed.length) await coordinator.appendCheckpointAfterCommit(participantId, "get");
+					return textResult(formatBatchTransfer(result), result);
+				}
+				const result = await coordinator.getPermission(participantId, target, resources[0], cwd);
 				await coordinator.appendCheckpointAfterCommit(participantId, "get");
-				return textResult(`Got ${resources.join(", ")} back from ${targetId}`, { resources, targetId });
+				return textResult(formatTransferResult(result), result);
 			},
 		},
 		{
@@ -246,11 +245,19 @@ export function buildTools(coordinator: PiCoordinator, participantId: Participan
 			async execute(_id, params: Static<typeof checkoutSchema>) { const result = await coordinator.authority.checkout(participantId, params.resource, params.state as VersionId); await coordinator.appendCheckpointAfterCommit(participantId, "checkout"); return textResult(`Checked out ${result.stateId}`, result); },
 		},
 		{
-			name: "rewind", label: "rewind (Linden)", description: "Parent-only exact Pi tree navigation for a child; branch summaries are disabled, real effects are reconciled in a notice, and no model turn starts automatically.", promptSnippet: "Rewind a direct child's Pi context without reverting global effects", executionMode: "sequential", parameters: rewindSchema,
+			name: "branch", label: "branch (Linden)", description: "Create a named history branch of a direct-child Agent and switch to it. Optional state selects a typed Agent checkpoint; omitted state preserves the full current context. The old branch keeps its progress. No model turn starts automatically.", promptSnippet: "Create and switch a direct child's history branch", executionMode: "sequential", parameters: branchSchema,
+			async execute(_id, params: Static<typeof branchSchema>) { const target = participantReference(params); await coordinator.branch(participantId, target, params.name, params.state); await coordinator.appendCheckpointAfterCommit(participantId, "branch"); return textResult(`Created and switched ${target} to branch ${params.name}`); },
+		},
+		{
+			name: "switch", label: "switch (Linden)", description: "Switch a direct-child Agent to an existing history branch. Its context is restored, current authority and external effects remain, and any navigation notice advances the selected branch. No model turn starts automatically.", promptSnippet: "Switch a direct child's history branch", executionMode: "sequential", parameters: switchSchema,
+			async execute(_id, params: Static<typeof switchSchema>) { const target = participantReference(params); await coordinator.switchBranch(participantId, target, params.name); await coordinator.appendCheckpointAfterCommit(participantId, "switch"); return textResult(`Switched ${target} to branch ${params.name}`); },
+		},
+		{
+			name: "rewind", label: "rewind (Linden)", description: "Move the current history branch of a direct-child Agent to an exact typed Pi checkpoint; other branches and history nodes are retained. Real effects are reconciled in a notice, and no model turn starts automatically.", promptSnippet: "Rewind a direct child's Pi context without reverting global effects", executionMode: "sequential", parameters: rewindSchema,
 			async execute(_id, params: Static<typeof rewindSchema>) { const target = participantReference(params); await coordinator.rewind(participantId, target, params.state as VersionId); await coordinator.appendCheckpointAfterCommit(participantId, "rewind"); return textResult(`Rewound ${target} to ${params.state}`); },
 		},
 		{
-			name: "log", label: "log (Linden)", description: "Show a durable File version tree, Agent checkpoint tree, or Term epoch/command history with exit codes and output ranges. IDs grant no new authority.", promptSnippet: "Inspect scoped File, Agent, or Term history", parameters: logSchema,
+			name: "log", label: "log (Linden)", description: "Show a durable File version tree, Agent history with named branch heads and the current branch, or Term epoch/command history with exit codes and output ranges. IDs grant no new authority.", promptSnippet: "Inspect scoped File, Agent, or Term history", parameters: logSchema,
 			async execute(_id, params: Static<typeof logSchema>) {
 				return textResult(await coordinator.formatParticipantLog(participantId, params.target));
 			},
@@ -264,11 +271,27 @@ export function buildTools(coordinator: PiCoordinator, participantId: Participan
 			async execute(_id, params: Static<typeof termInputSchema>) { const target = participantReference(params); await participantApi.termInput(participantId, target, params.data); return textResult(`Wrote stdin to ${target}`, { participantId: target }); },
 		},
 		{
-			name: "archive", label: "archive! (Linden)", description: "Destructively archive a stopped direct child: atomically reclaim its subtree's external authority and remove that stopped subtree from the live participant tree. This cannot be undone.", promptSnippet: "Reclaim and remove a stopped direct child subtree", executionMode: "sequential", parameters: participantSchema,
+			name: "archive", label: "archive! (Linden)", description: "Archive a stopped direct child: atomically reclaim its subtree authority and retain its history for unarchive or fork.", promptSnippet: "Reclaim and remove a stopped direct child subtree", executionMode: "sequential", parameters: participantSchema,
 			async execute(_id, params: Static<typeof participantSchema>) { const target = participantReference(params); await participantApi.archive(participantId, target); await coordinator.appendCheckpointAfterCommit(participantId, "archive"); return textResult(`Archived and removed ${target}`); },
 		},
 		{
-			name: "authority", label: "authority (Linden)", description: "Show current session-global ownership, pointers, and participant relations.", promptSnippet: "Inspect current Linden authority", parameters: authoritySchema,
+			name: "unarchive", label: "unarchive (Linden)", description: "Restore a retained direct-child subtree, stopped, only if all original complete permissions can be returned atomically. Changed Files and restored Net generate runtime notices; unchanged Files do not.", parameters: participantSchema, executionMode: "sequential",
+			async execute(_id, params: Static<typeof participantSchema>) { const ids = await coordinator.unarchive(participantId, participantReference(params)); return textResult(`Restored ${ids.join(", ")}`, { participants: ids }); },
+		},
+		{
+			name: "fork", label: "fork (Linden)", description: "Copy the current branch of one live or retained direct-child Agent into a new stopped Agent, with no resource permissions, children, processes, old checkpoints, or pending work. The new Agent receives a fork notice.", parameters: Type.Object({ ...participantFields, name: Type.Optional(Type.String()) }), executionMode: "sequential",
+			async execute(_id, params: { participant?: string; agent?: string; name?: string }) { const id = await coordinator.fork(participantId, participantReference(params), params.name); return textResult(`Forked ${id}`, { participantId: id }); },
+		},
+		{
+			name: "publish", label: "publish (Linden Net)", description: "Publish a live descendant Term's internal TCP port under an exact Net you completely own. Uses a workspace broker; does not bind an arbitrary host port. A bridge can be starting until the service listens.", parameters: Type.Object({ ...participantFields, resource: Type.String(), internalPort: Type.Integer({ minimum: 1, maximum: 65535 }) }), executionMode: "sequential",
+			async execute(_id, params: { participant?: string; agent?: string; resource: string; internalPort: number }) { const id = await coordinator.publishNet(participantId, participantReference(params), params.resource, params.internalPort); return textResult(`Published ${id}`); },
+		},
+		{
+			name: "unpublish", label: "unpublish (Linden Net)", description: "Remove a publication you completely own and control. Closes routed connections and the bridge, while the Term service continues. Required before moving a published Net.", parameters: Type.Object({ resource: Type.String() }), executionMode: "sequential",
+			async execute(_id, params: { resource: string }) { await coordinator.unpublishNet(participantId, params.resource); return textResult(`Unpublished ${params.resource}`); },
+		},
+		{
+			name: "authority", label: "authority (Linden)", description: "Show your currently held and managed subtree permissions, policy, and participant relations.", promptSnippet: "Inspect current Linden authority", parameters: authoritySchema,
 			async execute(_id, params: Static<typeof authoritySchema>) { return textResult(coordinator.describeAuthority(participantId, params.participant ?? participantId)); },
 		},
 	];

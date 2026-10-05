@@ -318,8 +318,9 @@ test("Human log permits Agent self and arbitrary Agent/Term descendants but reje
 		}
 		coordinator.runtimes.set(term, fakeTermRuntime(term).runtime);
 
-		assert.equal(await coordinator.formatAgentLog(parent, parent), "No Pi entries.");
-		assert.equal(await coordinator.formatAgentLog(human, grandchild), "No Pi entries.");
+		const emptyAgentLog = "Current branch: main\nBranches:\nnone\nNo Pi entries.";
+		assert.equal(await coordinator.formatAgentLog(parent, parent), emptyAgentLog);
+		assert.equal(await coordinator.formatAgentLog(human, grandchild), emptyAgentLog);
 		assert.equal(await coordinator.formatParticipantLog(human, term), `No Term epochs for ${term}.`);
 		await assert.rejects(coordinator.formatAgentLog(grandchild, parent), /ROLE_FORGERY|ROLE_MISMATCH/);
 		await assert.rejects(coordinator.formatAgentLog(sibling, parent), /ROLE_FORGERY|ROLE_MISMATCH/);

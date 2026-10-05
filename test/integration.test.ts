@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
 import { StandalonePiHost } from "../src/pi/host.js";
 
 test("typed Agent checkpoints are scoped and rewind never restores transferred ownership", async () => {
@@ -22,7 +22,7 @@ test("typed Agent checkpoints are scoped and rewind never restores transferred o
 		const later = await manager.recordCheckpoint(laterEnvelope, "pi-entry-after-raw", "pi-entry-not-typed", node.id);
 		assert.equal(later.parentId, node.id);
 		await manager.give(parent, child, file.resourceId);
-		const web = manager.materializeWeb(manager.rootParticipantId, "web:api.example.com/");
+		const web = await manager.materializeNet(manager.rootParticipantId, "net:tcp/dns/api.example.com:443");
 		await manager.give(manager.rootParticipantId, parent, web);
 		await manager.give(parent, child, web);
 		const grandchild = "agent:rewind-grandchild";
@@ -40,8 +40,8 @@ test("typed Agent checkpoints are scoped and rewind never restores transferred o
 		assert.match(notice, /get:/);
 		assert.match(notice, /spawn:/);
 		assert.match(notice, /target=agent:rewind-grandchild/);
-		assert.match(notice, /current Web authority=web:api\.example\.com\//);
-		assert.match(notice, /Web\/network authority transfer remains committed/);
+		assert.match(notice, /current Net authority=net:tcp\/dns\/api\.example\.com:443/);
+		assert.match(notice, /Net\/network authority transfer remains committed/);
 		assert.match(notice, /possible network side effects may remain/);
 		assert.match(notice, /cannot observe exact remote mutations/);
 		for (const effect of beforeRewind.effects.filter((candidate) => candidate.sequence > envelope.ledgerSequence)) {

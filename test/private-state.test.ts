@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { sandboxRequirements } from "./runtime-requirements.js";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
 
-const hasBwrap = spawnSync("which", ["bwrap"], { stdio: "ignore" }).status === 0;
+const sandboxRuntime = await sandboxRequirements();
+const hasBwrap = sandboxRuntime.available;
 
 test("the entire .linden tree is private across sessions", async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-private-state-"));

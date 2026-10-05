@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { sandboxRequirements } from "./runtime-requirements.js";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,10 +8,7 @@ import { StandalonePiHost } from "../src/pi/host.js";
 import { PiCoordinator } from "../src/pi/runtime.js";
 import { SessionAuthorityManager } from "../src/runtime/manager.js";
 
-const hasTermRuntime = process.platform === "linux"
-	&& spawnSync("which", ["bwrap"], { stdio: "ignore" }).status === 0
-	&& spawnSync("which", ["script"], { stdio: "ignore" }).status === 0
-	&& spawnSync("which", ["socat"], { stdio: "ignore" }).status === 0;
+const sandboxRuntime = await sandboxRequirements(["script", "socat"]);
 
 async function until(predicate: () => boolean, timeout = 3_000): Promise<void> {
 	const deadline = Date.now() + timeout;
@@ -21,7 +18,7 @@ async function until(predicate: () => boolean, timeout = 3_000): Promise<void> {
 	}
 }
 
-test("Human host API spawns a Term and controls its asynchronous stdin lifecycle", { skip: !hasTermRuntime }, async () => {
+test("Human host API spawns a Term and controls its asynchronous stdin lifecycle", { skip: sandboxRuntime.skip }, async () => {
 	const container = mkdtempSync(join(tmpdir(), "linden-human-term-"));
 	const base = join(container, "workspace");
 	const stateRoot = join(container, "state");
@@ -59,7 +56,7 @@ test("Human host API spawns a Term and controls its asynchronous stdin lifecycle
 	}
 });
 
-test("Term log preserves command and output history across a cold session reopen without restoring a live Term", { skip: !hasTermRuntime }, async () => {
+test("Term log preserves command and output history across a cold session reopen without restoring a live Term", { skip: sandboxRuntime.skip }, async () => {
 	const container = mkdtempSync("/tmp/linden-term-log-");
 	const base = join(container, "workspace");
 	const stateRoot = join(container, "state");
@@ -113,7 +110,7 @@ test("Term log preserves command and output history across a cold session reopen
 	}
 });
 
-test("get rejects an open Term epoch immediately and leaves its background work running", { skip: !hasTermRuntime }, async () => {
+test("get rejects an open Term epoch immediately and leaves its background work running", { skip: sandboxRuntime.skip }, async () => {
 	const container = mkdtempSync(join(tmpdir(), "linden-term-get-open-"));
 	const base = join(container, "workspace");
 	const stateRoot = join(container, "state");
@@ -143,7 +140,7 @@ test("get rejects an open Term epoch immediately and leaves its background work 
 	}
 });
 
-test("Term interrupt leaves descendants running, while stop and archive consume the whole subtree", { skip: !hasTermRuntime }, async () => {
+test("Term interrupt leaves descendants running, while stop and archive consume the whole subtree", { skip: sandboxRuntime.skip }, async () => {
 	const workspace = mkdtempSync(join(tmpdir(), "linden-term-tree-"));
 	let coordinator: PiCoordinator | undefined;
 	try {

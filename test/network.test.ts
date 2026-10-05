@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
-import { DomainGuard, NetworkBridge, domainMatches, hostSelectorContains, privateAddress } from "../src/runtime/network.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
+import { NetworkBridge, connectPublication, type NetworkGuard } from "../src/runtime/network-bridge.js";
+import { NetGuard } from "../src/runtime/net-guard.js";
 
 const listen = (server: Server): Promise<number> => new Promise((resolvePromise, reject) => {
 	server.once("error", reject);
@@ -25,7 +26,42 @@ const waitFor = async (predicate: () => boolean, message: string): Promise<void>
 	throw new Error(message);
 };
 
-const localGuard = { resolveAllowed: async () => "127.0.0.1" } as unknown as DomainGuard;
+const localGuard: NetworkGuard = { resolveTarget: async (_host: string, port: number) => ({ address: "127.0.0.1", port }) };
+
+function proxyRequest(socketPath: string, url: string): Promise<string> {
+	return new Promise((resolvePromise, reject) => {
+		const client = connect(socketPath);
+		let output = "";
+		client.once("error", reject);
+		client.once("connect", () => client.write(`GET ${url} HTTP/1.1\r\nHost: ${new URL(url).host}\r\nConnection: close\r\n\r\n`));
+		client.on("data", (chunk) => { output += chunk.toString(); });
+		client.once("end", () => resolvePromise(output));
+	});
+}
+
+test("publication broker pins a Unix socket and rejects symlink routes", { skip: process.platform !== "linux" }, async () => {
+	const directory = mkdtempSync(join(tmpdir(), "linden-publication-pin-"));
+	const path = join(directory, "service.sock");
+	const server = createHttpServer((_request, response) => response.end("published service"));
+	await new Promise<void>((resolvePromise, reject) => { server.once("error", reject); server.listen(path, resolvePromise); });
+	const endpoint = "net:tcp/dns/published.example:443";
+	const guard = new NetGuard(() => ({ endpoints: [endpoint], exclusions: [] }), (id) => id === endpoint ? path : undefined);
+	const bridge = new NetworkBridge(guard);
+	await bridge.start();
+	try {
+		symlinkSync(path, join(directory, "alias.sock"));
+		assert.throws(() => connectPublication(join(directory, "alias.sock")), /INVALID_SOCKET/);
+		const response = await proxyRequest(bridge.httpSocket!, "http://published.example:443/");
+		assert.match(response, /200 OK/);
+		assert.match(response, /published service/);
+		assert.match(await proxyRequest(bridge.httpSocket!, "http://published.example:444/"), /403 Forbidden/);
+		assert.match(await proxyRequest(bridge.httpSocket!, "http://other.example:443/"), /403 Forbidden/);
+	} finally {
+		await bridge.stop();
+		await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
 
 function trackSocket(set: Set<Socket>, socket: Socket): void {
 	set.add(socket);
@@ -40,56 +76,67 @@ function flood(socket: Socket): void {
 	write();
 }
 
-test("Web domain patterns match only the requested host boundary", () => {
-	assert.equal(domainMatches("api.example.com", "*.example.com"), true);
-	assert.equal(domainMatches("example.com", "*.example.com"), false);
-	assert.equal(domainMatches("notexample.com", "*.example.com"), false);
-	assert.equal(domainMatches("API.EXAMPLE.COM.", "api.example.com"), true);
-	assert.equal(hostSelectorContains("*.example.com", "api.example.com"), true);
-	assert.equal(hostSelectorContains("*.example.com", "*.api.example.com"), true);
-	assert.equal(hostSelectorContains("api.example.com", "*.api.example.com"), false);
+test("NetGuard uses live exact/public authority and audits only allowed routes", async () => {
+	const authority = { endpoints: ["net:tcp/public"], exclusions: ["net:tcp/8.8.8.8:443"] };
+	const audit: Array<[string, string]> = [];
+	const guard: NetworkGuard = new NetGuard(() => authority, undefined, (id, address) => audit.push([id, address]));
+	assert.deepEqual(await guard.resolveTarget("8.8.8.8", 80), { address: "8.8.8.8", port: 80 });
+	assert.equal(await guard.resolveTarget("8.8.8.8", 443), undefined);
+	assert.equal(await guard.resolveTarget("127.0.0.1", 80), undefined);
+	assert.equal(await guard.resolveTarget("8.8.8.8", 0), undefined);
+	assert.equal(await guard.resolveTarget("8.8.8.8", 65536), undefined);
+
+	authority.endpoints = ["net:tcp/127.0.0.1:80", "net:tcp/[::1]:443"];
+	assert.deepEqual(await guard.resolveTarget("127.0.0.1", 80), { address: "127.0.0.1", port: 80 });
+	assert.deepEqual(await guard.resolveTarget("[::1]", 443), { address: "::1", port: 443 });
+	assert.equal(await guard.resolveTarget("127.0.0.1", 81), undefined);
+	assert.equal(await guard.resolveTarget("8.8.8.8", 80), undefined);
+	assert.deepEqual(audit, [["net:tcp/8.8.8.8:80", "8.8.8.8"], ["net:tcp/127.0.0.1:80", "127.0.0.1"], ["net:tcp/[::1]:443", "::1"]]);
 });
 
-test("Web authority rejects non-public and IPv4-mapped addresses", async () => {
-	for (const address of [
-		"127.0.0.1",
-		"100.64.0.1",
-		"169.254.169.254",
-		"224.0.0.1",
-		"::1",
-		"::ffff:127.0.0.1",
-		"fc00::1",
-		"fe80::1",
-	]) assert.equal(privateAddress(address), true, address);
-	assert.equal(privateAddress("8.8.8.8"), false);
-	assert.equal(privateAddress("2606:4700:4700::1111"), false);
-	assert.equal(await new DomainGuard(["127.0.0.1"]).resolveAllowed("127.0.0.1"), undefined);
-	assert.equal(await new DomainGuard(["8.8.8.8"]).resolveAllowed("8.8.8.8"), "8.8.8.8");
+test("Net publication lookup requires the exact canonical DNS/IP identity and port", async () => {
+	const endpoint = "net:tcp/dns/published.example:443";
+	const authority = { endpoints: [endpoint], exclusions: [] as string[] };
+	const lookups: string[] = [];
+	const audit: Array<[string, string]> = [];
+	const guard = new NetGuard(() => authority, (id) => { lookups.push(id); return "/tmp/publication.sock"; }, (id, address) => audit.push([id, address]));
+	assert.deepEqual(await guard.resolveTarget("PUBLISHED.EXAMPLE.", 443), { address: "127.0.0.1", port: 443, socketPath: "/tmp/publication.sock" });
+	assert.equal(await guard.resolveTarget("published.example", 80), undefined);
+	assert.equal(await guard.resolveTarget("127.0.0.1", 443), undefined);
+	assert.equal(await guard.resolveTarget("other.example", 443), undefined);
+	assert.deepEqual(lookups, [endpoint]);
+	assert.deepEqual(audit, [[endpoint, "unix:/tmp/publication.sock"]]);
+	authority.endpoints = [];
+	assert.equal(await guard.resolveTarget("published.example", 443), undefined);
+	assert.deepEqual(lookups, [endpoint], "revoked authority cannot consult a stale publication");
 });
 
-test("human Web authority is implicit while Agent grants move and return across a direct edge", async () => {
-	const base = mkdtempSync(join(tmpdir(), "linden-web-v3-"));
+test("explicit DNS Net authority still rejects private answers", async () => {
+	const audit: string[] = [];
+	const guard = new NetGuard(() => ({ endpoints: ["net:tcp/dns/localhost:80"], exclusions: [] }), undefined, (id) => audit.push(id));
+	assert.equal(await guard.resolveTarget("localhost", 80), undefined);
+	assert.deepEqual(audit, []);
+});
+
+test("public Net authority is explicit and transfers only over direct edges", async () => {
+	const base = mkdtempSync(join(tmpdir(), "linden-net-v7-"));
 	try {
-		const manager = await SessionAuthorityManager.open({ base, stateDir: join(base, ".state"), lindenSessionId: "session:99999999-9999-9999-9999-999999999999" });
+		const manager = await SessionAuthorityManager.open({ base, stateDir: join(base, ".state"), rootParticipantId: "human:net-test" });
 		const human = manager.rootParticipantId;
-		const child = "agent:web-child";
-		await manager.spawnWith(human, child, "web child", [], async () => ({ piSessionId: "web-child" }), { inheritWorkspaceRead: false });
-		assert.deepEqual(manager.effectiveAuthority(human).webDomains, ["*"]);
-		assert.deepEqual(manager.effectiveAuthority(child).webDomains, []);
-		const web = manager.materializeWeb(human, "web:*.example.com/");
-		await manager.give(human, child, web);
-		assert.deepEqual(manager.effectiveAuthority(child).webDomains, ["*.example.com"]);
-		const grandchild = "agent:web-grandchild";
-		await manager.spawnWith(child, grandchild, "web grandchild", [], async () => ({ piSessionId: "web-grandchild" }), { inheritWorkspaceRead: false });
-		const exact = manager.materializeWeb(child, "web:api.example.com/");
-		await manager.give(child, grandchild, exact);
-		assert.equal(manager.resource(exact)?.ownerId, grandchild);
-		assert.throws(() => manager.materializeWeb(child, "web:other.test/"), /does not own a Web selector/);
-		assert.throws(() => manager.materializeWeb(human, "web:v1.api.example.com/"), /does not own the most-specific Web selector/);
-		await manager.get(human, child, web);
-		assert.equal(manager.resource(web)?.ownerId, human);
-		assert.equal(manager.resource(exact)?.ownerId, grandchild, "a broad get does not cross the child-grandchild edge");
-		assert.throws(() => manager.materializeWeb(human, "web:example.com/private/path"), /URL paths/);
+		const child = "agent:net-child";
+		await manager.spawnWith(human, child, "net child", [], async () => ({}), { inheritWorkspaceRead: false });
+		assert.deepEqual(manager.effectiveAuthority(human).netEndpoints, ["net:tcp/public"]);
+		assert.deepEqual(manager.effectiveAuthority(child).netEndpoints, []);
+		await manager.give(human, child, "net:tcp/public");
+		const endpoint = await manager.materializeNet(child, "net:tcp/dns/api.example.com:443");
+		const grandchild = "agent:net-grandchild";
+		await manager.spawnWith(child, grandchild, "net grandchild", [], async () => ({}), { inheritWorkspaceRead: false });
+		await manager.give(child, grandchild, endpoint);
+		await assert.rejects(manager.materializeNet(human, "net:tcp/dns/other.test:443"), /UNAUTHORIZED|complete Net/);
+		await manager.get(human, child, "net:tcp/public");
+		assert.equal(manager.ownerOf(endpoint), grandchild, "a broad get cannot skip the direct edge");
+		assert.ok(manager.effectiveAuthority(human).netExclusions?.includes(endpoint));
+		assert.throws(() => manager.materializeWeb(human, "web:example.com/"), /historical/);
 	} finally { rmSync(base, { recursive: true, force: true }); }
 });
 

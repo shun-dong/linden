@@ -13,7 +13,7 @@ test("a fresh root lookup returns the exact canonical base region without refine
 	try {
 		const manager = await SessionAuthorityManager.open({ workspace, stateDir: join(workspace, ".linden-test") });
 		const baseId = fileResourceId(workspace, true);
-		assert.equal(manager.resource(baseId), undefined, "the base region starts lazily materialized");
+		assert.equal(manager.resource(baseId)?.kind, "file-region", "initial authority is explicit");
 
 		const located = manager.locateCoveringPath(manager.rootParticipantId, workspace, "read");
 		assert.deepEqual(located, { parentResourceId: baseId, path: workspace, refined: false });
@@ -43,7 +43,7 @@ test("a fresh Pi spawn can move file:./ as the exact base grant", async () => {
 			};
 			return { session, async dispose() {} } as any;
 		});
-		assert.equal(manager.resource(baseId), undefined, "spawn begins with a cold base region");
+		assert.equal(manager.ownerOf(baseId), human, "spawn begins with an explicit base grant");
 
 		const child = await coordinator.spawn(human, "worker", undefined, ["file:./"], true, workspace);
 		assert.equal(manager.ownerOf(baseId), child);

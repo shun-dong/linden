@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
 import { canonicalBase, fileResourceId, resolvePublicPath } from "../src/runtime/paths.js";
 import { SessionRegistry } from "../src/runtime/sessions.js";
 import { PiCoordinator } from "../src/pi/runtime.js";
@@ -43,8 +43,8 @@ test("active base leases reject same, ancestor, and descendant bases but allow s
 		const nestedSession = registry.create(nested, "session:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
 		const rightSession = registry.create(right, "session:cccccccc-cccc-cccc-cccc-cccccccccccc");
 		const lease = registry.acquire(leftSession);
-		assert.throws(() => registry.acquire(leftSession), /ACTIVE_BASE_CONFLICT/);
-		assert.throws(() => registry.acquire(nestedSession), /ACTIVE_BASE_CONFLICT/);
+		assert.throws(() => registry.acquire(leftSession), /ACTIVE_WRITE_CONFLICT/);
+		assert.throws(() => registry.acquire(nestedSession), /ACTIVE_WRITE_CONFLICT/);
 		const siblingLease = registry.acquire(rightSession);
 		siblingLease.release();
 		lease.release();
@@ -76,7 +76,7 @@ test("File resolver canonicalizes relative forms and rejects base escape", async
 		assert.equal(resolvePublicPath("./note.txt", cwd, base, []), plain);
 		assert.equal(fileResourceId(plain), fileResourceId(resolvePublicPath(plain, base, base, [])));
 		assert.match(fileResourceId(base, true), /^file:.*\/$/);
-		assert.throws(() => resolvePublicPath("../../escape.txt", cwd, base, []), /PATH_OUTSIDE_BASE/);
+		assert.equal(resolvePublicPath("../../escape.txt", cwd, base, []), join(container, "escape.txt"));
 		const manager = await SessionAuthorityManager.open({ base, stateRoot: join(container, "state"), lindenSessionId: "session:eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee" });
 		const baseResource = manager.baseResourceId();
 		assert.equal(manager.snapshot().resources[baseResource]?.kind, "file-region");

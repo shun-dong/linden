@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionAuthorityManager } from "../src/authority/manager.js";
+import { SessionAuthorityManager } from "../src/runtime/manager.js";
 
 async function spawn(manager: SessionAuthorityManager, parentId: string, childId: string, onCreate?: () => void): Promise<void> {
 	await manager.spawnWith(parentId, childId, childId, [], async () => {
